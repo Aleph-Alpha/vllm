@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizers import MistralTokenizer
 from vllm.transformers_utils.utils import check_gguf_file
 from vllm.utils import make_async
+from vllm.v1.hat.hat_tokenizer import HATTokenizer
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -224,6 +225,10 @@ def get_tokenizer(
     if tokenizer_mode == "mistral":
         tokenizer = MistralTokenizer.from_pretrained(str(tokenizer_name),
                                                      revision=revision)
+    elif tokenizer_mode == "hat":
+        special_token_dict = kwargs.get("special_token_dict")
+        assert special_token_dict is not None, "special_token_dict is required for HATTokenizer"
+        tokenizer = HATTokenizer(special_token_dict=special_token_dict)
     elif tokenizer_mode == "custom":
         from vllm.transformers_utils.tokenizer_base import TokenizerRegistry
         tokenizer = TokenizerRegistry.get_tokenizer(str(tokenizer_name),

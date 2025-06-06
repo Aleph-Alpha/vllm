@@ -217,7 +217,7 @@ def is_init_field(cls: ConfigType, name: str) -> bool:
     return next(f for f in fields(cls) if f.name == name).init
 
 
-TokenizerMode = Literal["auto", "slow", "mistral", "custom"]
+TokenizerMode = Literal["auto", "slow", "mistral", "custom", "hat"]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
 
 
@@ -540,6 +540,8 @@ class ModelConfig:
                                hf_overrides_kw=hf_overrides_kw,
                                hf_overrides_fn=hf_overrides_fn)
         self.hf_config = hf_config
+        if self.hf_config.model_type == "hierarchical_autoregressive_transformer":
+            self.tokenizer_mode = "hat"
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(self.hf_text_config,
