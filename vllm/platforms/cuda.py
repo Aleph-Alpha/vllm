@@ -122,7 +122,13 @@ class CudaPlatformBase(Platform):
         model_config = vllm_config.model_config
 
         if parallel_config.worker_cls == "auto":
-            if scheduler_config.is_multi_step:
+            if model_config.hf_config.model_type == "hierarchical_autoregressive_transformer":
+                if envs.VLLM_USE_V1:
+                    parallel_config.worker_cls = \
+                        "vllm.v1.hat.hat_worker.create_hat_worker"
+                else:
+                    raise NotImplementedError("HAT is only supported on vLLM V1.")
+            elif scheduler_config.is_multi_step:
                 if envs.VLLM_USE_V1:
                     raise NotImplementedError(
                         "Multi-step scheduling is not supported (and not "
