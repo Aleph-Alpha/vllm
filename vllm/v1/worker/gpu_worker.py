@@ -4,7 +4,7 @@
 import copy
 import gc
 import os
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
 import torch.distributed
@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
@@ -47,6 +48,7 @@ class Worker(WorkerBase):
         rank: int,
         distributed_init_method: str,
         is_driver_worker: bool = False,
+        model_runner_cls: Optional[Type[LoRAModelRunnerMixin]] = None,
     ):
 
         super().__init__(vllm_config=vllm_config,
@@ -54,6 +56,8 @@ class Worker(WorkerBase):
                          rank=rank,
                          distributed_init_method=distributed_init_method,
                          is_driver_worker=is_driver_worker)
+        
+        self.model_runner_cls = model_runner_cls
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -168,9 +172,12 @@ class Worker(WorkerBase):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
-        # Construct the model runner
-        self.model_runner: GPUModelRunner = GPUModelRunner(
-            self.vllm_config, self.device)
+        if self.model_runner_cls is None:
+            self.model_runner = GPUModelRunner(
+                self.vllm_config, self.device)
+        else:
+            self.model_runner = self.model_runner_cls(
+                self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

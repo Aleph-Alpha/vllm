@@ -1,10 +1,22 @@
-from typing import Optional
+from typing import List, Optional
+
+import torch
+from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
+from vllm.device_allocator.cumem import CuMemAllocator
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.model_executor.utils import set_random_seed
 from vllm.utils import resolve_obj_by_qualname
+from vllm.v1.hat.hat_model_runner import HATModelRunner
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.worker_base import WorkerBase
 from transformers import PretrainedConfig
 import copy
+
+logger = init_logger(__name__)
 
 
 def create_hat_worker(*args, **kwargs):
@@ -41,7 +53,7 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args, **kwar
         worker_config.cache_config.sliding_window = None
 
     kwargs["vllm_config"] = worker_config
-    # kwargs["model_runner_cls"] = HATModelRunner
+    kwargs["model_runner_cls"] = HATModelRunner
     worker_class = resolve_obj_by_qualname("vllm.v1.worker.gpu_worker.Worker")
     worker = worker_class(*args, **kwargs)
     return worker
@@ -55,15 +67,17 @@ class HATWorker(WorkerBase):
         self.encoder_worker = encoder_worker
         self.decoder_worker = decoder_worker
         self.backbone_worker = backbone_worker
-        self.decoder_model_runner = decoder_worker.model_runner
-        self.backbone_model_runner = backbone_worker.model_runner
+        
         self.encoder_connector = None
         self.use_cuda_graph = vllm_config.compilation_config.max_capture_size > 0
         self.hat_manager = None
         self.pred_word_embeds_buffer = None
-        self.vllm_config = vllm_config
         self.backbone_num_gpu_blocks: Optional[int] = None
         self.process_full_word = False
+        
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.scheduler_config = vllm_config.scheduler_config
         
     def init_device(self) -> None:
         self.encoder_worker.init_device()
@@ -72,15 +86,195 @@ class HATWorker(WorkerBase):
         self.decoder_worker.load_model()
         self.backbone_worker.init_device()
         self.backbone_worker.load_model()
+        
+        self.encoder_model_runner = self.encoder_worker.model_runner
+        self.decoder_model_runner = self.decoder_worker.model_runner
+        self.backbone_model_runner = self.backbone_worker.model_runner
     
     def load_model(self) -> None:
         pass
+    
+    def determine_available_memory(self) -> int:
+        # TODO
+        return int(10e9)
+    
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """Get specifications for KV cache implementation."""
+        encoder_spec = self.encoder_worker.get_kv_cache_spec()
+        decoder_spec = self.decoder_worker.get_kv_cache_spec()
+        backbone_spec = self.backbone_worker.get_kv_cache_spec()
+        
+        encoder_spec.update(decoder_spec)
+        encoder_spec.update(backbone_spec)
+        return encoder_spec
+    
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        # Here we call self.model_runner.initialize_kv_cache        
+        if self.vllm_config.model_config.enable_sleep_mode:
+            allocator = CuMemAllocator.get_instance()
+            context = allocator.use_memory_pool(tag="kv_cache")
+        else:
+            from contextlib import nullcontext
+            context = nullcontext()
+        with context:
+            kv_cache_config_backbone = KVCacheConfig(
+                num_blocks=kv_cache_config.num_blocks,
+                kv_cache_tensors=[],
+                kv_cache_groups=kv_cache_config.kv_cache_groups[:-1]
+            )
+            kv_cache_config_enc_dec = KVCacheConfig(
+                num_blocks=kv_cache_config.num_blocks,
+                kv_cache_tensors=[],
+                kv_cache_groups=kv_cache_config.kv_cache_groups[-1:]
+            )
+            self.decoder_model_runner.initialize_kv_cache(kv_cache_config_enc_dec)
+            self.backbone_model_runner.initialize_kv_cache(kv_cache_config_backbone)
+            self.encoder_model_runner.initialize_kv_cache(kv_cache_config_enc_dec)
+                    
+        # Now the model runner has the attention backends initialised
+        # 1. Create kv_caches
+        # 2. Bind relevant KV_caches to each model runner
+        
+        # Initialize the memory buffer for KV cache
+        kv_cache_raw_tensors = _allocate_kv_cache_tensors(kv_cache_config)
+        # Change the memory buffer to the desired shape
+        attn_backends = [*self.backbone_model_runner.attn_backends, self.encoder_model_runner.attn_backends[0]]
+    
+        kv_caches = _reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors, attn_backends)
+        
+        # We want to bind the kv_cache separately for each model runner
+        encoder_forward_context = self.encoder_model_runner.vllm_config.compilation_config.static_forward_context
+        filtered_kv_caches_enc = {k: v for k, v in kv_caches.items() if k in encoder_forward_context}
+        bind_kv_cache(filtered_kv_caches_enc, encoder_forward_context, self.encoder_model_runner.kv_caches)
+        
+        decoder_forward_context = self.decoder_model_runner.vllm_config.compilation_config.static_forward_context
+        filtered_kv_caches_dec = {k: v for k, v in kv_caches.items() if k in decoder_forward_context}
+        bind_kv_cache(filtered_kv_caches_dec, decoder_forward_context, self.decoder_model_runner.kv_caches)
+        
+        backbone_forward_context = self.backbone_model_runner.vllm_config.compilation_config.static_forward_context
+        filtered_kv_caches_backbone = {k: v for k, v in kv_caches.items() if k in backbone_forward_context}
+        bind_kv_cache(filtered_kv_caches_backbone, backbone_forward_context, self.backbone_model_runner.kv_caches)
+        
+    def _compile_or_warm_up_model(self, model_runner, run_sampler: bool = False) -> None:
+        # warm up sizes that are not in cudagraph capture sizes,
+        # but users still want to compile for better performance,
+        # e.g. for the max-num-batched token size in chunked prefill.
+        warmup_sizes = model_runner.vllm_config.compilation_config.compile_sizes.copy()
+        if not self.model_config.enforce_eager:
+            warmup_sizes = [
+                x for x in warmup_sizes if x not in
+                self.vllm_config.compilation_config.cudagraph_capture_sizes
+            ]
+        for size in sorted(warmup_sizes, reverse=True):
+            logger.info("Compile and warming up model for size %d", size)
+            model_runner._dummy_run(size)
+        if not self.model_config.enforce_eager:
+            model_runner.capture_model()
 
-    def initialize_cache(self, num_gpu_blocks: int,
-                         num_cpu_blocks: int) -> None:
-        self.encoder_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                             num_cpu_blocks=num_cpu_blocks)
-        self.decoder_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                             num_cpu_blocks=num_cpu_blocks)
-        self.backbone_worker.initialize_cache(num_gpu_blocks=self.backbone_num_gpu_blocks,
-                                              num_cpu_blocks=num_cpu_blocks)
+        # Warm up sampler and preallocate memory buffer for logits and other
+        # sampling related tensors of max possible shape to avoid memory
+        # fragmentation issue.
+        # NOTE: This is called after `capture_model` on purpose to prevent
+        # memory buffers from being cleared by `torch.cuda.empty_cache`.
+        if get_pp_group().is_last_rank:
+            max_num_reqs = min(self.scheduler_config.max_num_seqs,
+                               self.scheduler_config.max_num_batched_tokens)
+            model_runner._dummy_sampler_run(
+                hidden_states=model_runner._dummy_run(
+                    num_tokens=max_num_reqs))
+
+        # Reset the seed to ensure that the random state is not affected by
+        # the model initialization and profiling.
+        set_random_seed(self.model_config.seed)
+        
+    def compile_or_warm_up_model(self) -> None:
+        self._compile_or_warm_up_model(self.backbone_model_runner)
+        self._compile_or_warm_up_model(self.encoder_model_runner)
+        self._compile_or_warm_up_model(self.decoder_model_runner, True)    
+            
+        
+def _allocate_kv_cache_tensors(
+        kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    """
+    Initializes the KV cache buffer with the correct size. The buffer needs
+    to be reshaped to the desired shape before being used by the models.
+
+    Args:
+        kv_cache_config: The KV cache config 
+    Returns:
+        dict[str, torch.Tensor]: A map between layer names to their 
+        corresponding memory buffer for KV cache.
+        """
+    kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        tensor = torch.zeros(kv_cache_tensor.size,
+                                dtype=torch.int8,
+                                device="cuda")
+        for layer_name in kv_cache_tensor.shared_by:
+            kv_cache_raw_tensors[layer_name] = tensor
+
+    layer_names = set()
+    for group in kv_cache_config.kv_cache_groups:
+        layer_names.update(group.layer_names)
+    assert layer_names == set(kv_cache_raw_tensors.keys(
+    )), "Some layers are not correctly initialized"
+    return kv_cache_raw_tensors
+
+def _reshape_kv_cache_tensors(
+    kv_cache_config: KVCacheConfig,
+    kv_cache_raw_tensors: dict[str, torch.Tensor],
+    attn_backends: List[AttentionBackend],
+) -> dict[str, torch.Tensor]:
+    """
+    Reshape the KV cache tensors to the desired shape and dtype.
+
+    Args:
+        kv_cache_config: The KV cache config 
+        kv_cache_raw_tensors: The KV cache buffer of each layer, with 
+        correct size but uninitialized shape.
+    Returns:
+        Dict[str, torch.Tensor]: A map between layer names to their 
+        corresponding memory buffer for KV cache.
+    """
+    kv_caches: dict[str, torch.Tensor] = {}
+    for i, kv_cache_group_spec in enumerate(
+            kv_cache_config.kv_cache_groups):
+        kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+        for layer_name in kv_cache_group_spec.layer_names:
+            raw_tensor = kv_cache_raw_tensors[layer_name]
+            assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+            num_blocks = (raw_tensor.numel() //
+                            kv_cache_spec.page_size_bytes)
+            if isinstance(kv_cache_spec, AttentionSpec):
+                kv_cache_shape = attn_backends[i].get_kv_cache_shape(
+                    num_blocks, kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                dtype = kv_cache_spec.dtype
+                try:
+                    kv_cache_stride_order = attn_backends[
+                        i].get_kv_cache_stride_order()
+                    assert len(kv_cache_stride_order) == len(
+                        kv_cache_shape)
+                except (AttributeError, NotImplementedError):
+                    kv_cache_stride_order = tuple(
+                        range(len(kv_cache_shape)))
+                # The allocation respects the backend-defined stride order
+                # to ensure the semantic remains consistent for each
+                # backend. We first obtain the generic kv cache shape and
+                # then permute it according to the stride order which could
+                # result in a non-contiguous tensor.
+                kv_cache_shape = tuple(kv_cache_shape[i]
+                                        for i in kv_cache_stride_order)
+                # Maintain original KV shape view.
+                inv_order = [
+                    kv_cache_stride_order.index(i)
+                    for i in range(len(kv_cache_stride_order))
+                ]
+                kv_caches[layer_name] = kv_cache_raw_tensors[
+                    layer_name].view(dtype).view(kv_cache_shape).permute(
+                        *inv_order)
+            else:
+                raise NotImplementedError
+    return kv_caches
+    
+        
