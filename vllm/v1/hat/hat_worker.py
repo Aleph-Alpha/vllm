@@ -9,8 +9,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.utils import set_random_seed
 from vllm.utils import resolve_obj_by_qualname
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.worker_base import WorkerBase
 from transformers import PretrainedConfig
@@ -78,6 +81,10 @@ class HATWorker(WorkerBase):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
+
+        #self.text = "An Apple a day keeps the doctor away"
+        self.text = "🚀🎉🔥⭐".encode("utf-8")
+        self.idx = 0
         
     def init_device(self) -> None:
         self.encoder_worker.init_device()
@@ -90,6 +97,7 @@ class HATWorker(WorkerBase):
         self.encoder_model_runner = self.encoder_worker.model_runner
         self.decoder_model_runner = self.decoder_worker.model_runner
         self.backbone_model_runner = self.backbone_worker.model_runner
+        self.first = True
     
     def load_model(self) -> None:
         pass
@@ -154,6 +162,12 @@ class HATWorker(WorkerBase):
         backbone_forward_context = self.backbone_model_runner.vllm_config.compilation_config.static_forward_context
         filtered_kv_caches_backbone = {k: v for k, v in kv_caches.items() if k in backbone_forward_context}
         bind_kv_cache(filtered_kv_caches_backbone, backbone_forward_context, self.backbone_model_runner.kv_caches)
+
+        self.hat_manager = HATManager(special_token_dict=self.vllm_config.model_config.hf_config.special_token_dict,
+                                      max_word_size = self.vllm_config.model_config.hf_config.max_word_size,
+                                      device=self.device,
+                                      rank=self.rank,
+                                      driver_rank=self.driver_rank)
         
     def _compile_or_warm_up_model(self, model_runner, run_sampler: bool = False) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
@@ -176,7 +190,7 @@ class HATWorker(WorkerBase):
         # fragmentation issue.
         # NOTE: This is called after `capture_model` on purpose to prevent
         # memory buffers from being cleared by `torch.cuda.empty_cache`.
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and run_sampler:
             max_num_reqs = min(self.scheduler_config.max_num_seqs,
                                self.scheduler_config.max_num_batched_tokens)
             model_runner._dummy_sampler_run(
@@ -191,6 +205,69 @@ class HATWorker(WorkerBase):
         self._compile_or_warm_up_model(self.backbone_model_runner)
         self._compile_or_warm_up_model(self.encoder_model_runner)
         self._compile_or_warm_up_model(self.decoder_model_runner, True)    
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> Optional[ModelRunnerOutput]:
+
+        if not scheduler_output.num_scheduled_tokens:
+            return self._handle_empty_scheduler_output(scheduler_output)
+        
+        print(scheduler_output)
+        scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
+
+        encoder_output = self.encoder_worker.execute_model(scheduler_output_byte)
+
+        scheduler_output_byte, scheduler_output_word = self.hat_manager.handle_encoder_output(scheduler_output_byte,
+                                                                                              scheduler_output_word,
+                                                                                              encoder_output)
+        
+        ids = []
+        for req in scheduler_output.scheduled_new_reqs:
+            ids.append(req.req_id)
+        for req in scheduler_output.scheduled_cached_reqs:
+            ids.append(req.req_id)
+        
+        sampled_token_ids = []
+        for _ in ids:
+            samples = []
+            for _ in range(1):
+                samples.append(98)
+                #sampled_token_ids.append(self.text[self.idx])
+                self.idx = (self.idx + 1) % len(self.text)
+            sampled_token_ids.append(samples)
+
+        output = ModelRunnerOutput(
+            req_ids=ids,
+            req_id_to_index={id_: i for i, id_ in enumerate(ids)},
+            sampled_token_ids=sampled_token_ids,
+            spec_token_ids=None,
+            prompt_logprobs_dict={id_: None for id_ in ids},
+            logprobs=None,
+        )
+
+        return output
+    
+    def _handle_empty_scheduler_output(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
+        self.encoder_worker.execute_model(scheduler_output)
+        self.decoder_worker.execute_model(scheduler_output)
+        self.backbone_worker.execute_model(scheduler_output)
+        return EMPTY_MODEL_RUNNER_OUTPUT
+
+    @property
+    def rank(self):
+        return self.encoder_worker.rank
+
+    @property
+    def device(self):
+        return self.encoder_worker.device
+
+    @property
+    def driver_rank(self) -> int:
+        return 0
+
             
         
 def _allocate_kv_cache_tensors(

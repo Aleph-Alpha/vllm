@@ -30,6 +30,7 @@ from vllm.forward_context import (DPMetadata, get_forward_context,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
+from vllm.model_executor.models.hat import HATBackboneForCausalLM, HATDecoderForCausalLM, HATEncoderForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
 from vllm.multimodal.utils import group_mm_inputs_by_modality
@@ -40,6 +41,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         check_use_alibi, is_pin_memory_available)
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+from vllm.v1.hat.hat_utils import HATBatchInfo, HATOutputState, HATSubmodelRole
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
                                         SlidingWindowSpec)
@@ -60,23 +62,40 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 if TYPE_CHECKING:
-    import xgrammar as xgr
-
-    from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
-else:
-    xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 logger = init_logger(__name__)
 
 
 class HATModelRunner(GPUModelRunner):
+
+    def __init__( self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        self.type: Optional[HATSubmodelRole] = None
+        self.hat_batch_info: Optional[HATBatchInfo] = None
+
+    def _set_type(self) -> None:
+        if isinstance(self.model, HATEncoderForCausalLM):
+            self.type = HATSubmodelRole.ENCODER
+        elif isinstance(self.model, HATDecoderForCausalLM):
+            self.type = HATSubmodelRole.DECODER
+        elif isinstance(self.model, HATBackboneForCausalLM):
+            self.type = HATSubmodelRole.BACKBONE
+        else:
+            raise ValueError(f"Unknown HAT model type: {type(self.model)}. Can't instantiate HATModelRunner.")
+    
+    def prepare_forward_pass(self, hat_batch_info: HATBatchInfo):
+        self.hat_batch_info = hat_batch_info
+
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+    ) -> Union[ModelRunnerOutput, IntermediateTensors, HATOutputState]:
+
+        if self.type is None:
+            self._set_type()
 
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
@@ -87,7 +106,7 @@ class HATModelRunner(GPUModelRunner):
             return self.kv_connector_no_forward(scheduler_output)
 
         # Prepare the decoder inputs.
-        attn_metadata, logits_indices, spec_decode_metadata = (
+        attn_metadata, logits_indices, _ = (
             self._prepare_inputs(scheduler_output))
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if (self.use_cuda_graph
@@ -112,15 +131,7 @@ class HATModelRunner(GPUModelRunner):
         num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
         num_input_tokens += num_pad
 
-        mm_embeds = []
-
-        # For text-only models, we use token ids as input.
-        # While it is possible to use embeddings as input just like the
-        # multimodal models, it is not desirable for performance since
-        # then the embedding layer is not included in the CUDA graph.
         input_ids = self.input_ids[:num_input_tokens]
-        inputs_embeds = None
-        
         positions = self.positions[:num_input_tokens]
 
         if get_pp_group().is_first_rank:
@@ -129,20 +140,54 @@ class HATModelRunner(GPUModelRunner):
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
 
-        # Run the decoder.
-        # Use persistent buffers for CUDA graphs.
+
+        match self.type:
+            case HATSubmodelRole.ENCODER:
+                model_kwargs = {
+                    "input_ids": input_ids,
+                    "inputs_embeds": None,
+                    "positions": positions,
+                    "intermediate_tensors": None,
+                }
+            case HATSubmodelRole.BACKBONE:
+                model_kwargs = {
+                    "input_ids": None,
+                    "inputs_embeds": None,
+                    "positions": positions,
+                    "previous_hidden_states": self.hat_batch_info.latent_word_embeddings,
+                    "intermediate_tensors": None,
+                }
+            case HATSubmodelRole.DECODER:
+                if (self.use_cuda_graph
+                        and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
+                    model_kwargs = {
+                        # Reuse input_ids for word positions, because the decoder does not need input_ids
+                        "input_ids": self.hat_batch_info.word_positions,
+                        "inputs_embeds": None,
+                        "positions": positions,
+                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
+                        "intermediate_tensors": None,
+                    }
+                else:
+                    model_kwargs = {
+                        # Reuse input_ids for word positions, because the decoder does not need input_ids
+                        "input_ids": self.hat_batch_info.word_positions,
+                        "inputs_embeds": None,
+                        "positions": positions,
+                        "cu_seqlens_q": self.hat_batch_info.cu_seqlen_words,
+                        "max_seqlen_q": self.hat_batch_info.max_seqlen_words,
+                        "predictive_word_embeddings": self.hat_batch_info.predictive_word_embeddings,
+                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
+                        "intermediate_tensors": None,
+                    }
+
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
                                  num_tokens_across_dp=num_tokens_across_dp):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-            )
+            model_output = self.model(**model_kwargs)
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
@@ -152,13 +197,11 @@ class HATModelRunner(GPUModelRunner):
             hidden_states, aux_hidden_states = model_output
         else:
             hidden_states = model_output
-        # Broadcast PP output for external_launcher (torchrun)
-        # to make sure we are synced across pp ranks
-        # TODO: Support overlapping mirco-batches
-        # https://github.com/vllm-project/vllm/issues/18019
+
         broadcast_pp_output = \
             self.parallel_config.distributed_executor_backend \
             == "external_launcher" and len(get_pp_group().ranks) > 0
+
         if not get_pp_group().is_last_rank:
             # For mid-pipeline stages, return the hidden states.
             if not broadcast_pp_output:
@@ -167,9 +210,12 @@ class HATModelRunner(GPUModelRunner):
             get_pp_group().send_tensor_dict(hidden_states.tensors,
                                             all_gather_group=get_tp_group())
             logits = None
-        else:
+        elif self.type == HATSubmodelRole.DECODER:
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
+        else:
+            return HATOutputState(hidden_states=hidden_states, req_id_to_index=self.input_batch.req_id_to_index)
+
         if broadcast_pp_output:
             model_output_broadcast_data = {
                 "logits": logits.contiguous(),

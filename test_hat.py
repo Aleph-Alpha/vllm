@@ -140,8 +140,9 @@ prompts_8 = prompts_128[:8]
 prompts_4 = prompts_128[:4]
 prompts_2 = prompts_128[:2]
 prompts_1 = [prompts_128[0]]
+prompts_1 = ["An apple a day", "A cat is a dog and a dog is a cat"]
 
-max_tokens = 1000
+max_tokens = 100
 sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
 
 format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -157,9 +158,12 @@ if __name__ == "__main__":
           enforce_eager=True,
           tensor_parallel_size=1,
           gpu_memory_utilization=0.9,
+          disable_cascade_attn=True,
+          max_num_batched_tokens=20000,
           max_model_len=20000, # Can be set to 100k on A100
-          max_num_seqs=128)
-    outputs = llm.generate([format_llama(p) for p in prompts_1], sampling_params)
+          max_num_seqs=5)
+    outputs = llm.generate([p for p in prompts_1], sampling_params)
+    #outputs = llm.generate([format_llama(p) for p in prompts_1], sampling_params)
 
     for output in outputs:
         prompt = output.prompt

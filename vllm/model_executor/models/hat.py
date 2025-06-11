@@ -776,10 +776,11 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
 
-        if vllm_config.compilation_config.max_capture_size > 0:
-            buffer = torch.zeros(vllm_config.compilation_config.max_capture_size,
-                                config.cross_attention_config.hidden_size_kv)
-            self.register_buffer('pred_word_embeds_buffer', buffer)
+        buffer_pred_word_embeds = torch.zeros(256, config.cross_attention_config.hidden_size_kv)
+        self.register_buffer('pred_word_embeds_buffer', buffer_pred_word_embeds)
+
+        buffer_previous_hidden_states = torch.zeros(256, config.hidden_size)
+        self.register_buffer('previous_hidden_states_buffer', buffer_previous_hidden_states)
 
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
@@ -799,7 +800,7 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
     def forward(
         self,
         positions: torch.Tensor,
-        previous_hidden_states: torch.Tensor,
+        previous_hidden_states: Optional[torch.Tensor] = None,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         max_seqlen_q: Optional[torch.Tensor] = None,
         predictive_word_embeddings: Optional[torch.Tensor] = None,
@@ -809,12 +810,16 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
     ) -> torch.Tensor:
 
         if predictive_word_embeddings is None:
-            predictive_word_embeddings = self.pred_word_embeds_buffer[:previous_hidden_states.shape[0], :]
+            predictive_word_embeddings = self.pred_word_embeds_buffer[:positions.shape[0], :]
             cu_seqlens_q = torch.arange(positions.shape[0] + 1, device=positions.device, dtype=torch.int32)
             max_seqlen_q = 1
 
+        if previous_hidden_states is None:
+            previous_hidden_states = self.previous_hidden_states_buffer[:positions.shape[0], :]
+
         cu_seqlens_k = torch.arange(input_ids.shape[0] + 1, device=input_ids.device, dtype=torch.int32)
         max_seqlen_k = 1
+        input_ids = input_ids.to(torch.int64)
 
         model_output = self.decoder(positions, previous_hidden_states, cu_seqlens_q, cu_seqlens_k,
                                     max_seqlen_q, max_seqlen_k, input_ids, predictive_word_embeddings)
@@ -922,6 +927,9 @@ class HATBackboneForCausalLM(nn.Module, SupportsLoRA):
         first_word_embedding = torch.nn.Parameter(torch.empty(1, 1, config.hidden_size)) 
         self.decoder_connector.register_parameter("first_word_embedding", first_word_embedding)
 
+        buffer = torch.zeros(256, config.hidden_size)
+        self.register_buffer('previous_hidden_states_buffer', buffer)
+
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
@@ -933,11 +941,15 @@ class HATBackboneForCausalLM(nn.Module, SupportsLoRA):
     def forward(
         self,
         positions: torch.Tensor,
-        previous_hidden_states: torch.Tensor,
+        previous_hidden_states: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         ) -> torch.Tensor:
+
+        if previous_hidden_states is None:
+            previous_hidden_states = self.previous_hidden_states_buffer[:positions.shape[0], :]
+
         model_output = self.backbone(positions, previous_hidden_states)
         return model_output
 
