@@ -107,15 +107,10 @@ class HATModelRunner(GPUModelRunner):
             for kv_cache_group in self.kv_cache_config.kv_cache_groups
         ]
 
-        self.input_batch = InputBatch(
-            max_num_reqs=self.max_num_reqs,
-            max_model_len=self.max_model_len,
-            max_num_batched_tokens=self.max_num_tokens,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            vocab_size=self.model_config.get_vocab_size(),
-            block_sizes=block_sizes,
-        )
+        # L TODO: Check how slow this is later
+        req_ids = self.input_batch.req_ids[:]
+        for id_ in req_ids:
+            self.input_batch.remove_request(id_)
 
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
@@ -214,6 +209,11 @@ class HATModelRunner(GPUModelRunner):
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
             self.input_batch.add_request(req_state)
+
+        empty_indices = list(range(self.input_batch.num_reqs, self.max_num_reqs))
+        print(empty_indices)
+        if empty_indices:
+            self.input_batch.condense(empty_indices) 
 
         batch_reordered = self._may_reorder_batch(scheduler_output)
         assert not batch_reordered
@@ -317,7 +317,6 @@ class HATModelRunner(GPUModelRunner):
                         "intermediate_tensors": None,
                     }
 
-        print(attn_metadata)
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
