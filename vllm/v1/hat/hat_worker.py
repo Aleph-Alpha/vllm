@@ -12,6 +12,7 @@ from vllm.utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
+from vllm.v1.hat.hat_utils import HATBatchInfo
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
@@ -168,6 +169,7 @@ class HATWorker(WorkerBase):
                                       device=self.device,
                                       rank=self.rank,
                                       driver_rank=self.driver_rank)
+        self._setup_modules()
         
     def _compile_or_warm_up_model(self, model_runner, run_sampler: bool = False) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
@@ -218,12 +220,44 @@ class HATWorker(WorkerBase):
         print(scheduler_output)
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
 
-        encoder_output = self.encoder_worker.execute_model(scheduler_output_byte)
+        print(scheduler_output_byte)
+        encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output_byte)
+        print(encoder_hidden_states)
+        exit()
 
-        scheduler_output_byte, scheduler_output_word = self.hat_manager.handle_encoder_output(scheduler_output_byte,
-                                                                                              scheduler_output_word,
-                                                                                              encoder_output)
+        encoder_hidden_states_encoder_connector, encoder_hidden_states_enc_dec_loop, encoder_hidden_states_final_decoder, scheduler_output_byte_enc_dec = (
+            self.hat_manager.handle_encoder_output(scheduler_output_byte, encoder_hidden_states)
+        )
+
+        scheduler_output_byte_enc_dec_word_boundary = None
+        if encoder_hidden_states_enc_dec_loop is not None:
+            scheduler_output_byte_enc_dec_word_boundary = self.run_decode_loop(encoder_hidden_states_enc_dec_loop,
+                                                                               scheduler_output_byte_enc_dec)
         
+        if scheduler_output_byte_enc_dec_word_boundary is not None:
+            scheduler_output_word = self.hat_manager.combine_scheduler_outputs(scheduler_output_word,
+                                                                               scheduler_output_byte_enc_dec_word_boundary)
+
+        encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
+            self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
+        )
+        #print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector.shape)
+        #print("byte_positions", byte_positions.shape)
+        #print("word_positions", word_positions.shape)
+        #print("word_lens_bytes_per_task_excl_last_word", word_lens_bytes_per_task_excl_last_word.shape)
+
+        updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
+                                                                byte_positions,
+                                                                word_positions,
+                                                                word_lens_bytes_per_task_excl_last_word)
+        print(updated_latent_word_embeddings)
+        self.backbone_model_runner.prepare_forward_pass(HATBatchInfo(latent_word_embeddings=updated_latent_word_embeddings))
+        #print("scheduler_output_word", scheduler_output_word)
+        predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output_word)
+        print(predictive_word_embeddings)
+        exit()
+
+
         ids = []
         for req in scheduler_output.scheduled_new_reqs:
             ids.append(req.req_id)
@@ -250,11 +284,22 @@ class HATWorker(WorkerBase):
 
         return output
     
+    def run_decode_loop(self, encoder_hidden_states_enc_dec_loop: torch.Tensor, scheduler_output_byte_enc_dec: SchedulerOutput):
+        pass
+    
     def _handle_empty_scheduler_output(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         self.encoder_worker.execute_model(scheduler_output)
         self.decoder_worker.execute_model(scheduler_output)
         self.backbone_worker.execute_model(scheduler_output)
         return EMPTY_MODEL_RUNNER_OUTPUT
+    
+    def _setup_modules(self):
+        self.encoder_connector = self.encoder_worker.get_model().encoder_connector
+        self.hat_manager.first_word_embedding = (
+            self.backbone_worker.get_model().decoder_connector.first_word_embedding.squeeze(0)
+        )
+        if self.use_cuda_graph:
+            self.pred_word_embeds_buffer = self.decoder_worker.get_model().pred_word_embeds_buffer
 
     @property
     def rank(self):

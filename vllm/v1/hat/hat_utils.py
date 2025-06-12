@@ -16,6 +16,7 @@ class HATSequenceState:
     num_computed_tokens_backbone: int
     block_table_backbone: List[List[int]]
     word_lens_bytes: List[int]
+    num_scheduled_tokens_byte: int
 
     # Predictive word embedding from the previous word (needed by the decoder)
     prev_pred_backbone_embedding: Optional[torch.Tensor] # Shape [word_windwow_size, D]
@@ -26,6 +27,7 @@ class HATSequenceState:
 
     # Byte and word position of the current sequence we are generating tokens for
     word_position: torch.Tensor
+    word_position_cpu: int
     byte_position: int
 
 
@@ -37,12 +39,6 @@ class HATBatchInfo:
     predictive_word_embeddings: Optional[torch.Tensor] = None
     latent_word_embeddings: Optional[torch.Tensor] = None
     encoder_hidden_states: Optional[torch.Tensor] = None
-
-
-@dataclass
-class HATOutputState:
-    hidden_states: torch.Tensor
-    req_id_to_index: dict[str, int]
 
 
 class HATSubmodelRole(str, Enum):
