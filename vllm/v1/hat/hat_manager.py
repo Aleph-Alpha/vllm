@@ -269,6 +269,27 @@ class HATManager:
         word_positions = torch.hstack(word_positions)
 
         return encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions
+    
+    def handle_backbone_output(self, scheduler_output_word: SchedulerOutput,
+                               predictive_word_embeddings: torch.Tensor):
+        # L TODO: self.num_decodes might not be correct here when we later run for a static num of bytes
+        predictive_word_embeddings_decodes = predictive_word_embeddings[-self.num_decodes:, :].clone()
+        predictive_word_embeddings_decoder = []
+
+        num_decodes = 0
+        offset = 0
+        for scheduled_req in scheduler_output_word.scheduled_new_reqs + scheduler_output_word.scheduled_cached_reqs:
+            req_id = scheduled_req.req_id
+            req_state = self.req_ids_to_hat_state[req_id]
+            if req_state.is_partial_prefill:
+                offset += len(req_state.word_lens_bytes)
+                req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
+            elif len(req_state.word_lens_bytes) == 1 and req_state.word_lens_bytes[0] == 1:
+                req_state.prev_pred_backbone_embedding = predictive_word_embeddings_decodes[num_decodes, :].unsqueeze(0)
+                num_decodes += 1
+            else:
+                offset += len(req_state.word_lens_bytes)
+                req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
 
     def _add_new_sequence(self, new_req_data: NewRequestData, num_scheduled_tokens: int):
         """Initialises HATSequenceState for a new sequence and
