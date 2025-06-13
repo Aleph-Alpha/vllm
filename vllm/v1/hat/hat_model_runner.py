@@ -345,7 +345,6 @@ class HATModelRunner(GPUModelRunner):
         elif self.type == HATSubmodelRole.DECODER:
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
-            print(logits)
         else:
             return hidden_states
 
@@ -369,8 +368,6 @@ class HATModelRunner(GPUModelRunner):
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-        print(sampler_output)
-        print("########################################################")
 
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
