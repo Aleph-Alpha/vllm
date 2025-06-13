@@ -221,7 +221,7 @@ class HATWorker(WorkerBase):
 
         encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output_byte)
 
-        encoder_hidden_states_encoder_connector, encoder_hidden_states_enc_dec_loop, encoder_hidden_states_final_decoder, scheduler_output_byte_enc_dec = (
+        encoder_hidden_states_encoder_connector, encoder_hidden_states_enc_dec_loop, encoder_hidden_states_final_decoder, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte, encoder_hidden_states)
         )
 
@@ -250,8 +250,25 @@ class HATWorker(WorkerBase):
         self.backbone_model_runner.prepare_forward_pass(HATBatchInfo(latent_word_embeddings=updated_latent_word_embeddings))
         #print("scheduler_output_word", scheduler_output_word)
         predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output_word)
-        self.hat_manager.handle_backbone_output(scheduler_output_word, predictive_word_embeddings)
-
+        predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_word, predictive_word_embeddings)
+        
+        word_positions_final_decoder, cu_seqlens_q_final_decoder, max_seqlen_q_final_decoder = self.hat_manager.prepare_input_final_decoder(scheduler_output_word)
+        
+        # For decoder we now have
+        # scheduler_output_byte_final_decoder
+        # predictive_word_embeddings_final_decoder
+        # encoder_hidden_states_final_decoder
+        # word_positions_final_decoder
+        
+        hat_batch_info_final_decoder = HATBatchInfo(predictive_word_embeddings=predictive_word_embeddings_final_decoder,
+                                                    word_positions=word_positions_final_decoder,
+                                                    encoder_hidden_states=encoder_hidden_states_final_decoder,
+                                                    cu_seqlen_words=cu_seqlens_q_final_decoder,
+                                                    max_seqlen_words=max_seqlen_q_final_decoder)
+        self.decoder_model_runner.prepare_forward_pass(hat_batch_info_final_decoder)
+        model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_final_decoder)
+        
+        self.hat_manager.process_outputs_prefill_chunked_prefill(scheduler_output_byte_final_decoder, model_runner_output)
 
         ids = []
         for req in scheduler_output.scheduled_new_reqs:

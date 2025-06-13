@@ -108,9 +108,11 @@ class HATModelRunner(GPUModelRunner):
         ]
 
         # L TODO: Check how slow this is later
+        
         req_ids = self.input_batch.req_ids[:]
         for id_ in req_ids:
             self.input_batch.remove_request(id_)
+        num_reqs_previous_worker_step = len(req_ids)
 
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
@@ -210,16 +212,10 @@ class HATModelRunner(GPUModelRunner):
             req_state = self.requests[req_id]
             self.input_batch.add_request(req_state)
 
-        empty_indices = list(range(self.input_batch.num_reqs, self.max_num_reqs))
-        print(empty_indices)
-        if empty_indices:
-            self.input_batch.condense(empty_indices) 
-
         batch_reordered = self._may_reorder_batch(scheduler_output)
         assert not batch_reordered
 
-        if batch_reordered:
-            self.input_batch.refresh_sampling_metadata()
+        self.input_batch.refresh_sampling_metadata()
 
     @torch.inference_mode()
     def execute_model(
@@ -349,6 +345,7 @@ class HATModelRunner(GPUModelRunner):
         elif self.type == HATSubmodelRole.DECODER:
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
+            print(logits)
         else:
             return hidden_states
 
@@ -372,6 +369,8 @@ class HATModelRunner(GPUModelRunner):
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
+        print(sampler_output)
+        print("########################################################")
 
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
