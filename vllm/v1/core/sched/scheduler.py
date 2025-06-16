@@ -206,6 +206,7 @@ class Scheduler(SchedulerInterface):
 
             num_new_tokens = (request.num_tokens_with_spec -
                               request.num_computed_tokens)
+            
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
@@ -799,6 +800,11 @@ class Scheduler(SchedulerInterface):
             # Append generated tokens and check for stop. Note that if
             # a request is still being prefilled, we expect the model runner
             # to return empty token ids for the request.
+
+            # L TODO: Check this later, especially for spec dec
+            # Here the assumption is that if multiple tokens are returned, all tokens minus the last one 
+            # will have already been computed.
+            request.num_computed_tokens += (len(new_token_ids) - 1)
             for num_new, output_token_id in enumerate(new_token_ids, 1):
                 request.append_output_token_ids(output_token_id)
 

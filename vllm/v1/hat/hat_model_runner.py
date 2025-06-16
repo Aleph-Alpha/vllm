@@ -112,7 +112,6 @@ class HATModelRunner(GPUModelRunner):
         req_ids = self.input_batch.req_ids[:]
         for id_ in req_ids:
             self.input_batch.remove_request(id_)
-        num_reqs_previous_worker_step = len(req_ids)
 
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
@@ -211,6 +210,8 @@ class HATModelRunner(GPUModelRunner):
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
             self.input_batch.add_request(req_state)
+        # We just want to execute the 2 trim statements at the end of the function
+        self.input_batch.condense([])
 
         batch_reordered = self._may_reorder_batch(scheduler_output)
         assert not batch_reordered

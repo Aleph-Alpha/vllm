@@ -532,12 +532,17 @@ class HATEncoderConnector(nn.Module):
         max_seqlen_k = word_lens_bytes_flat.max()
 
         # Update latent word embeddings with information from characters
-        print("Cross attention encoder connector shapes")
-        print("word_positions", word_positions)
-        print("latent word embeddings" ,latent_word_embeddings.shape)
-        print("encoder hidden states", encoder_hidden_states.shape)
-        print("byte positions", byte_positions)
+        #print("Cross attention encoder connector shapes")
+        #print("word_positions", word_positions)
+        #print("word_positions_shape", word_positions.shape)
+        #print("latent word embeddings" ,latent_word_embeddings.shape)
+        #print("encoder hidden states", encoder_hidden_states.shape)
+        #print("byte positions", byte_positions)
+        #print("byte positions_shape", byte_positions.shape)
         
+        print("\n\nInside encoder connector")
+        print("latent_word_embeddings", torch.any(torch.isnan(latent_word_embeddings)))
+        print("encoder_hidden_states", torch.any(torch.isnan(encoder_hidden_states)))
         updated_latent_word_embeddings = self.cross_attention_encoder_connector(
             q_position_ids=word_positions,
             q_input=latent_word_embeddings,
@@ -548,6 +553,7 @@ class HATEncoderConnector(nn.Module):
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k
         )
+        print("updated_latent_word_embeddings", torch.any(torch.isnan(updated_latent_word_embeddings)))
         return updated_latent_word_embeddings
 
     def load_weights(self, weights: Iterable[Tuple[str,
@@ -827,6 +833,11 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
         max_seqlen_k = 1
         input_ids = input_ids.to(torch.int64)
 
+        # print("DECODER ##############################")
+        # print("positions", positions)
+        # print("previous_hidden_states", previous_hidden_states.shape)
+        # print("input_ids", input_ids)
+        # print("predictive_word_embeddings", predictive_word_embeddings.shape)
         model_output = self.decoder(positions, previous_hidden_states, cu_seqlens_q, cu_seqlens_k,
                                     max_seqlen_q, max_seqlen_k, input_ids, predictive_word_embeddings)
         model_output = self.layer_norm(model_output)
