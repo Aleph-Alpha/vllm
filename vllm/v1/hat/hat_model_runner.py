@@ -273,8 +273,6 @@ class HATModelRunner(GPUModelRunner):
 
         match self.type:
             case HATSubmodelRole.ENCODER:
-                print(input_ids)
-                print(positions)
                 model_kwargs = {
                     "input_ids": input_ids,
                     "inputs_embeds": None,
@@ -347,7 +345,7 @@ class HATModelRunner(GPUModelRunner):
             logits = self.model.compute_logits(sample_hidden_states, None)
         else:
             return hidden_states
-
+        
         if broadcast_pp_output:
             model_output_broadcast_data = {
                 "logits": logits.contiguous(),

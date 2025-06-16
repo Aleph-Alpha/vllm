@@ -532,6 +532,12 @@ class HATEncoderConnector(nn.Module):
         max_seqlen_k = word_lens_bytes_flat.max()
 
         # Update latent word embeddings with information from characters
+        print("Cross attention encoder connector shapes")
+        print("word_positions", word_positions)
+        print("latent word embeddings" ,latent_word_embeddings.shape)
+        print("encoder hidden states", encoder_hidden_states.shape)
+        print("byte positions", byte_positions)
+        
         updated_latent_word_embeddings = self.cross_attention_encoder_connector(
             q_position_ids=word_positions,
             q_input=latent_word_embeddings,

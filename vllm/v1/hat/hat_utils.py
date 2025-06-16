@@ -4,6 +4,7 @@ from typing import List, Optional
 import torch
 
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 
 
 @dataclass
@@ -46,7 +47,6 @@ class HATSubmodelRole(str, Enum):
     DECODER = "decoder"
     BACKBONE = "backbone"
 
-
     
 def _create_empty_scheduler_output() -> SchedulerOutput:
     return SchedulerOutput(
@@ -63,3 +63,40 @@ def _create_empty_scheduler_output() -> SchedulerOutput:
         grammar_bitmask=None,
         kv_connector_metadata=None,
     )
+
+
+def _create_empty_model_runner_output() -> ModelRunnerOutput:
+    return ModelRunnerOutput(req_ids=[],
+                             req_id_to_index={},
+                             sampled_token_ids=[],
+                             spec_token_ids=None,
+                             logprobs=None,
+                             prompt_logprobs_dict={},
+                             finished_sending=None,
+                             finished_recving=None)
+    
+    
+def safe_tensor_slice(tensor: torch.Tensor, count: int, keep_prefix: bool=True) -> Optional[torch.Tensor]:
+    if count == 0:
+        if keep_prefix:
+            return tensor
+        else:
+            return torch.empty(0, tensor.shape[1], device=tensor.device)
+    else:
+        if keep_prefix:
+            return tensor[:-count, :]
+        else:
+            return tensor[-count:, :]
+        
+        
+def safe_list_slice(list: List, count: int, keep_prefix: bool=True) -> Optional[List]:
+        if count == 0:
+            if keep_prefix:
+                return list
+            else:
+                return []
+        else:
+            if keep_prefix:
+                return list[:-count]
+            else:
+                return list[-count:]

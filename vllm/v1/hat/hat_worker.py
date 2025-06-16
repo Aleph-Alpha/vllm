@@ -12,7 +12,7 @@ from vllm.utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
-from vllm.v1.hat.hat_utils import HATBatchInfo
+from vllm.v1.hat.hat_utils import HATBatchInfo, safe_list_slice
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
@@ -61,6 +61,7 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args, **kwar
     worker_class = resolve_obj_by_qualname("vllm.v1.worker.gpu_worker.Worker")
     worker = worker_class(*args, **kwargs)
     return worker
+
 
 class HATWorker(WorkerBase):
 
@@ -216,6 +217,7 @@ class HATWorker(WorkerBase):
 
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
+        print("\nscheduler output at the start", scheduler_output)
         
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
 
@@ -228,6 +230,12 @@ class HATWorker(WorkerBase):
         if encoder_hidden_states_enc_dec_loop is not None:
             self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec)
         
+        if scheduler_output_word.scheduled_new_reqs == 0 and scheduler_output_word.scheduled_cached_reqs == 0:
+            print("\noutput after decode loop", self.hat_manager.output)
+            output = self.hat_manager.output
+            self.hat_manager.reset_manager()
+            return output
+
         encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
             self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
         )
@@ -263,7 +271,15 @@ class HATWorker(WorkerBase):
         self.decoder_model_runner.prepare_forward_pass(hat_batch_info_final_decoder)
         model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_final_decoder)
         
+        scheduled_cached_reqs_dec_word_boundary = safe_list_slice(scheduler_output_byte_final_decoder.scheduled_cached_reqs,
+                                                                  self.hat_manager.num_decodes_word_boundary,
+                                                                  keep_prefix=False)
+        self.hat_manager.process_outputs_enc_dec_loop(scheduled_cached_reqs_dec_word_boundary, model_runner_output)
         self.hat_manager.process_outputs_prefill_chunked_prefill(scheduler_output_byte_final_decoder, model_runner_output)
+        print("\noutput", self.hat_manager.output)
+        output = self.hat_manager.output
+        self.hat_manager.reset_manager()
+        return output
 
         ids = []
         for req in scheduler_output.scheduled_new_reqs:
@@ -291,10 +307,10 @@ class HATWorker(WorkerBase):
 
         return output
     
-    def run_decode_loop(self, encoder_hidden_states_enc_dec_loop: torch.Tensor, scheduler_output_byte_enc_dec: SchedulerOutput):
+    def run_decode_loop(self, encoder_hidden_states: torch.Tensor, scheduler_output: SchedulerOutput):
         
-        predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output_byte_enc_dec)
-        word_positions = self.hat_manager.compute_position_ids_decoder_autoregressive_phase(scheduler_output_byte_enc_dec)
+        predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output)
+        word_positions = self.hat_manager.compute_position_ids_decoder_autoregressive_phase(scheduler_output)
         
         hat_batch_info = HATBatchInfo(predictive_word_embeddings=predictive_word_embeddings,
                                         word_positions=word_positions,
@@ -304,15 +320,15 @@ class HATWorker(WorkerBase):
                                                                     dtype=torch.int32),
                                         max_seqlen_words=1)
         self.decoder_model_runner.prepare_forward_pass(hat_batch_info)
-        model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_enc_dec)
-        self.hat_manager.process_outputs_enc_dec_loop(scheduler_output_byte_enc_dec, model_runner_output)
+        model_runner_output = self.decoder_worker.execute_model(scheduler_output)
+        scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
         
         while self.hat_manager.num_decodes_not_word_boundary > 0:
-            encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output_byte_enc_dec)
-            self.hat_manager.handle_encoder_output_loop(encoder_hidden_states, scheduler_output_byte_enc_dec)
+            encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output)
+            self.hat_manager.handle_encoder_output_loop(encoder_hidden_states, scheduler_output)
             
-            predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output_byte_enc_dec)
-            word_positions = self.hat_manager.compute_position_ids_decoder_autoregressive_phase(scheduler_output_byte_enc_dec)
+            predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output)
+            word_positions = self.hat_manager.compute_position_ids_decoder_autoregressive_phase(scheduler_output)
             
             hat_batch_info = HATBatchInfo(predictive_word_embeddings=predictive_word_embeddings,
                                           word_positions=word_positions,
@@ -322,8 +338,8 @@ class HATWorker(WorkerBase):
                                                                        dtype=torch.int32),
                                           max_seqlen_words=1)
             self.decoder_model_runner.prepare_forward_pass(hat_batch_info)
-            model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_enc_dec)
-            self.hat_manager.process_outputs_enc_dec_loop(scheduler_output_byte_enc_dec, model_runner_output)
+            model_runner_output = self.decoder_worker.execute_model(scheduler_output)
+            scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
     
     def _handle_empty_scheduler_output(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         self.encoder_worker.execute_model(scheduler_output)

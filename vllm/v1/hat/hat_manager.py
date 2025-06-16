@@ -4,8 +4,8 @@ import torch
 from vllm.sequence import ExecuteModelRequest
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
-from vllm.v1.hat.hat_utils import HATSequenceState, _create_empty_scheduler_output
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput, SamplerOutput
+from vllm.v1.hat.hat_utils import HATSequenceState, _create_empty_model_runner_output, _create_empty_scheduler_output, safe_list_slice, safe_tensor_slice
+from vllm.v1.outputs import ModelRunnerOutput
 
 
 class HATManager:
@@ -21,15 +21,14 @@ class HATManager:
         self.num_decodes_word_boundary = 0
         
         # This will include prefills, last chunked prefill and decodes
-        self.output: ModelRunnerOutput = EMPTY_MODEL_RUNNER_OUTPUT
+        self.output: ModelRunnerOutput = _create_empty_model_runner_output()
 
         self.first_word_embedding: torch.Tensor = None
         
     def reset_manager(self):
-        self.outputs = []
         self.num_decodes_not_word_boundary = 0
         self.num_decodes_word_boundary = 0
-        self.output = EMPTY_MODEL_RUNNER_OUTPUT
+        self.output = _create_empty_model_runner_output()
     
     def add_request(self, scheduler_output: SchedulerOutput) -> Tuple[SchedulerOutput, SchedulerOutput]:
 
@@ -162,11 +161,11 @@ class HATManager:
         # Contains encoder hidden states for prefill and chunked_prefills. 
         # Necessary for final decoder forward pass
         
-        encoder_hidden_states_final_decoder = self._safe_tensor_slice(encoder_hidden_states,
+        encoder_hidden_states_final_decoder = safe_tensor_slice(encoder_hidden_states,
                                                                       self.num_decodes_not_word_boundary)
         
         num_decodes = self.num_decodes_not_word_boundary + self.num_decodes_word_boundary
-        encoder_hidden_states_decodes = self._safe_tensor_slice(encoder_hidden_states,
+        encoder_hidden_states_decodes = safe_tensor_slice(encoder_hidden_states,
                                                                 num_decodes,
                                                                 keep_prefix=False).clone()
 
@@ -219,6 +218,7 @@ class HATManager:
                     scheduler_output_byte_final_decoder.total_num_scheduled_tokens += 1
                     scheduler_output_byte_final_decoder.finished_req_ids = scheduler_output_byte.finished_req_ids
                 else:
+                    # encoder_embeds_curr_word and curr_word_bytes are now synced
                     self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
                         encoder_hidden_states_decodes[decodes, :].unsqueeze(0)
                     )
@@ -290,7 +290,7 @@ class HATManager:
                 word_lens_bytes_per_task_excl_last_word.append(req_state.word_lens_bytes[:-1])
                 # For encoder connector, we need to include the last possibly incomplete word 
                 # the previous worker step for chunked prefills
-                word_lens_bytes_per_task_excl_last_word[-1][0] += len(req_state.encoder_embeds_curr_word)
+                word_lens_bytes_per_task_excl_last_word[-1][0] += len(req_state.curr_word_bytes)
                 num_bytes_last_word = req_state.word_lens_bytes[-1]
                 byte_positions.append(torch.arange(req_state.byte_position,
                                                    req_state.byte_position + req_state.num_scheduled_tokens_byte - num_bytes_last_word,
@@ -300,8 +300,8 @@ class HATManager:
                                                    device=self.device))
             elif len(req_state.word_lens_bytes) == 1 and req_state.word_lens_bytes[0] == 1:
                 # word_len_bytes_per_task only needed for final decoder
-                word_lens_bytes_per_task_excl_last_word.append([len(req_state.encoder_embeds_curr_word)])
-                byte_positions.append(torch.arange(req_state.byte_position - len(req_state.encoder_embeds_curr_word),
+                word_lens_bytes_per_task_excl_last_word.append([len(req_state.curr_word_bytes)])
+                byte_positions.append(torch.arange(req_state.byte_position - len(req_state.curr_word_bytes),
                                                    req_state.byte_position,
                                                    device=self.device))
                 word_positions.append(req_state.word_position)
@@ -327,9 +327,9 @@ class HATManager:
     def handle_backbone_output(self, scheduler_output_word: SchedulerOutput,
                                predictive_word_embeddings: torch.Tensor) -> torch.Tensor:
         # L TODO: self.num_decodes might not be correct here when we later run for a static num of bytes
-        predictive_word_embeddings_decodes = self._safe_tensor_slice(predictive_word_embeddings,
-                                                                     self.num_decodes_word_boundary,
-                                                                     keep_prefix=False).clone()
+        predictive_word_embeddings_decodes = safe_tensor_slice(predictive_word_embeddings,
+                                                               self.num_decodes_word_boundary,
+                                                               keep_prefix=False).clone()
         predictive_word_embeddings_final_decoder = []
 
         num_decodes = 0
@@ -407,53 +407,14 @@ class HATManager:
         
         predictive_word_embeddings = torch.cat(predictive_word_embeddings, dim=0)
         return predictive_word_embeddings
-    
-    def process_outputs_prefill_chunked_prefill(self, scheduler_output_byte_final_decoder: SchedulerOutput, model_runner_output: ModelRunnerOutput):
-        cached_reqs = self._safe_list_slice(scheduler_output_byte_final_decoder.scheduled_cached_reqs, 
-                                            self.num_decodes_word_boundary)
-        for scheduled_req in scheduler_output_byte_final_decoder.scheduled_new_reqs + cached_reqs:
-            req_id = scheduled_req.req_id
-            req_state = self.req_ids_to_hat_state[req_id]
-            
-            new_token_id = None
-            # If we are in prefill case or last chunked prefill 
-            if not req_state.is_partial_prefill or req_state.num_prompt_tokens==(req_state.num_scheduled_tokens_byte+scheduled_req.num_computed_tokens): 
-                assert req_id not in self.output.req_id_to_index
-                self.output.req_ids.append(req_id)
-                self.output.req_id_to_index[req_id] = len(self.output.req_ids) 
-                
-                req_id_index = model_runner_output.req_id_to_index[req_id]
-                
-                sampled_token_id: List[int] = model_runner_output.sampled_token_ids[req_id_index]
-                self.output.sampled_token_ids.append(sampled_token_id)
-                new_token_id = sampled_token_id[-1]
-                
-                self.output.prompt_logprobs_dict[req_id] = None
-                req_state.is_partial_prefill = False
 
-            num_scheduled_tokens_backbone = len(req_state.word_lens_bytes) - 1
-            req_state.byte_position += req_state.num_scheduled_tokens_byte
-            req_state.word_position += num_scheduled_tokens_backbone
-            req_state.word_position_cpu += num_scheduled_tokens_backbone
-            req_state.num_computed_tokens_backbone += num_scheduled_tokens_backbone
-
-            if req_state.is_partial_prefill:
-                continue
-                
-            # Prefill case or last chunked prefill            
-            curr_word_bytes = req_state.curr_word_bytes
-            curr_word_bytes.append(new_token_id)
-
-            if new_token_id == self.hat_splitter.eot_id:                
-                continue
-
-            is_new_word, words = self._check_byte_for_new_word(curr_word_bytes)
-            if is_new_word:
-                new_word_first_byte = req_state.curr_word_bytes.pop()
-                req_state.new_word_first_bytes = [new_word_first_byte]  
-                
+    def compute_position_ids_decoder_autoregressive_phase(self, 
+                                                          scheduler_output_byte_enc_dec: SchedulerOutput) -> torch.Tensor:
+        tensors = [self.req_ids_to_hat_state[scheduled_req.req_id].word_position for scheduled_req in scheduler_output_byte_enc_dec.scheduled_cached_reqs]
+        return torch.hstack(tensors)
+                    
     def update_backbone_info(self, scheduler_output_word: SchedulerOutput):
-        cached_reqs = self._safe_list_slice(scheduler_output_word.scheduled_cached_reqs, 
+        cached_reqs = safe_list_slice(scheduler_output_word.scheduled_cached_reqs, 
                                             self.num_decodes_word_boundary,
                                             keep_prefix=False)
         for scheduled_req in cached_reqs:
@@ -468,15 +429,101 @@ class HATManager:
             
             req_state.curr_word_bytes = req_state.new_word_first_bytes
             req_state.new_word_first_bytes = []
+    
+    def process_outputs_prefill_chunked_prefill(self, scheduler_output_byte_final_decoder: SchedulerOutput, model_runner_output: ModelRunnerOutput):
+        cached_reqs = safe_list_slice(scheduler_output_byte_final_decoder.scheduled_cached_reqs, 
+                                      self.num_decodes_word_boundary)
+        for scheduled_req in scheduler_output_byte_final_decoder.scheduled_new_reqs + cached_reqs:
+            req_id = scheduled_req.req_id
+            req_state = self.req_ids_to_hat_state[req_id]
             
-    def compute_position_ids_decoder_autoregressive_phase(self, 
-                                                          scheduler_output_byte_enc_dec: SchedulerOutput) -> torch.Tensor:
-        tensors = [self.req_ids_to_hat_state[scheduled_req.req_id].word_position
-                   for scheduled_req in scheduler_output_byte_enc_dec]
-        return torch.hstack(tensors)
-                    
-    def process_outputs_enc_dec_loop(self, scheduler_output_byte_enc_dec_running: SchedulerOutput, model_runner_output: ModelRunnerOutput):
-        pass
+            new_token_id = None
+            # If we are in prefill case or last chunked prefill 
+            if not req_state.is_partial_prefill or req_state.num_prompt_tokens==(req_state.num_scheduled_tokens_byte+scheduled_req.num_computed_tokens): 
+                assert req_id not in self.output.req_id_to_index
+                self.output.req_id_to_index[req_id] = len(self.output.req_ids) 
+                self.output.req_ids.append(req_id)
+                
+                req_id_index = model_runner_output.req_id_to_index[req_id]
+                
+                sampled_token_id: List[int] = model_runner_output.sampled_token_ids[req_id_index]
+                new_token_id = sampled_token_id[0]
+                self.output.sampled_token_ids.append([new_token_id])
+                
+                self.output.prompt_logprobs_dict[req_id] = None
+                req_state.is_partial_prefill = False
+
+            num_scheduled_tokens_backbone = len(req_state.word_lens_bytes) - 1
+            req_state.byte_position += req_state.num_scheduled_tokens_byte
+            req_state.word_position += num_scheduled_tokens_backbone
+            req_state.word_position_cpu += num_scheduled_tokens_backbone
+            req_state.num_computed_tokens_backbone += num_scheduled_tokens_backbone
+
+            if req_state.is_partial_prefill:
+                continue
+                
+            print("new token id", new_token_id)
+            # Prefill case or last chunked prefill            
+            curr_word_bytes = req_state.curr_word_bytes
+            curr_word_bytes.append(new_token_id)
+
+            if new_token_id == self.hat_splitter.eot_id:                
+                continue
+
+            is_new_word, words = self._check_byte_for_new_word(curr_word_bytes)
+            if is_new_word:
+                new_word_first_byte = req_state.curr_word_bytes.pop()
+                req_state.new_word_first_bytes = [new_word_first_byte]  
+                
+    def process_outputs_enc_dec_loop(self, scheduled_cached_reqs: List[CachedRequestData], model_runner_output: ModelRunnerOutput) -> SchedulerOutput:
+        """
+        - Take out decodes which have reached word boundary from SchedulerOutput. This means updating `scheduled_cached_reqs`, `num_scheduled_tokens`
+        `total_num_scheduled_tokens`
+        """
+        scheduler_output_byte_enc_dec_running_tmp = _create_empty_scheduler_output()
+        # scheduler_output_byte_enc_dec_running_tmp.finished_req_ids = scheduler_output_byte_enc_dec_running.finished_req_ids
+
+        for scheduled_req in scheduled_cached_reqs:
+            req_id = scheduled_req.req_id
+            req_state = self.req_ids_to_hat_state[req_id]
+
+            assert req_id in self.output.req_id_to_index
+            # self.output.req_id_to_index contains info for all seqs in this worker step
+            # model_runner_output only contains info about seq currently running in the loop
+            req_id_index_output = self.output.req_id_to_index[req_id]
+            req_id_index_step = model_runner_output.req_id_to_index[req_id]
+
+            sampled_token_id: List[int] = model_runner_output.sampled_token_ids[req_id_index_step]
+            new_token_id = sampled_token_id[-1]
+            print("new token id", new_token_id)
+            print("self.output.sampled_token_ids", self.output.sampled_token_ids)
+            self.output.sampled_token_ids[req_id_index_output].append(new_token_id)
+
+            req_state.byte_position += 1
+            curr_word_bytes = req_state.curr_word_bytes
+            curr_word_bytes.append(new_token_id)
+
+            if new_token_id == self.hat_splitter.eot_id:                
+                continue
+
+            is_new_word, words = self._check_byte_for_new_word(curr_word_bytes)
+            if is_new_word:
+                new_word_first_byte = req_state.curr_word_bytes.pop()
+                req_state.new_word_first_bytes = [new_word_first_byte]  
+            else:
+                cached_req = CachedRequestData(
+                    req_id=req_id,
+                    resumed_from_preemption=False,
+                    new_token_ids=[new_token_id],
+                    new_block_ids=[[]],
+                    num_computed_tokens=scheduled_req.num_computed_tokens + 1,
+                )
+                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.append(cached_req)
+                scheduler_output_byte_enc_dec_running_tmp.num_scheduled_tokens[req_id] = 1
+                scheduler_output_byte_enc_dec_running_tmp.total_num_scheduled_tokens += 1
+
+        self.num_decodes_not_word_boundary = len(scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs)
+        return scheduler_output_byte_enc_dec_running_tmp
         
     def _add_new_sequence(self, new_req_data: NewRequestData, num_scheduled_tokens: int):
         """Initialises HATSequenceState for a new sequence and
@@ -547,27 +594,3 @@ class HATManager:
             else:
                 return False, None
         return len(w) > 1, w
-    
-    def _safe_tensor_slice(self, tensor: torch.Tensor, count: int, keep_prefix: bool=True) -> Optional[torch.Tensor]:
-        if count == 0:
-            if keep_prefix:
-                return tensor
-            else:
-                return torch.empty(0, tensor.shape[1], device=tensor.device)
-        else:
-            if keep_prefix:
-                return tensor[:-count, :]
-            else:
-                return tensor[-count:, :]
-            
-    def _safe_list_slice(self, list: List, count: int, keep_prefix: bool=True) -> Optional[List]:
-        if count == 0:
-            if keep_prefix:
-                return list
-            else:
-                return []
-        else:
-            if keep_prefix:
-                return list[:-count]
-            else:
-                return list[-count:]

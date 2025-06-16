@@ -159,6 +159,7 @@ if __name__ == "__main__":
           enforce_eager=True,
           tensor_parallel_size=1,
           gpu_memory_utilization=0.9,
+          block_size=256,
           disable_cascade_attn=True,
           max_num_batched_tokens=20000,
           max_model_len=20000, # Can be set to 100k on A100
