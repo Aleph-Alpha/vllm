@@ -218,10 +218,10 @@ class HATWorker(WorkerBase):
 
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
-        print("\nscheduler output at the start", scheduler_output)
+        # print("\nscheduler output at the start", scheduler_output)
         
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
-        print("scheduler_output_word", scheduler_output_word)
+        # print("scheduler_output_word", scheduler_output_word)
 
         encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output_byte)
 
@@ -241,10 +241,10 @@ class HATWorker(WorkerBase):
         encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
             self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
         )
-        print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector)
-        print("word_lens_bytes_per_task_excl_last_word", word_lens_bytes_per_task_excl_last_word)
-        print("byte_positions", byte_positions)
-        print("word_positions", word_positions)
+        # print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector)
+        # print("word_lens_bytes_per_task_excl_last_word", word_lens_bytes_per_task_excl_last_word)
+        # print("byte_positions", byte_positions)
+        # print("word_positions", word_positions)
         #print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector.shape)
         #print("byte_positions", byte_positions.shape)
         #print("word_positions", word_positions.shape)
@@ -258,14 +258,15 @@ class HATWorker(WorkerBase):
         self.backbone_model_runner.prepare_forward_pass(HATBatchInfo(latent_word_embeddings=updated_latent_word_embeddings))
         #print("scheduler_output_word", scheduler_output_word)
         predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output_word)
-        print("predictive_word_embeddings", predictive_word_embeddings)
+        # print("predictive_word_embeddings", predictive_word_embeddings)
         predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_word, predictive_word_embeddings)
         self.hat_manager.update_backbone_info(scheduler_output_word)
         
         word_positions_final_decoder, cu_seqlens_q_final_decoder, max_seqlen_q_final_decoder = self.hat_manager.prepare_input_final_decoder(scheduler_output_word)
         
         if self.steps == 2:
-            exit()
+            # exit()
+            pass
         self.steps += 1
         # For decoder we now have
         # scheduler_output_byte_final_decoder

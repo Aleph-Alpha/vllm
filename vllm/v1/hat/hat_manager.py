@@ -78,7 +78,7 @@ class HATManager:
             assert req_id in self.req_ids_to_hat_state, f"Request {req_id} not found in HATManager"
             req_state = self.req_ids_to_hat_state[req_id]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            print("num_scheduled_tokens", num_scheduled_tokens)
+            # print("num_scheduled_tokens", num_scheduled_tokens)
 
             block_table_enc_dec = cached_req_data.new_block_ids[-1:]
             block_table_backbone = cached_req_data.new_block_ids[:-1]
@@ -285,10 +285,13 @@ class HATManager:
             if req_state.is_partial_prefill:
                 # word_lens_bytes_per_task.append(req_state.word_lens_bytes)
                 word_lens_bytes_per_task_excl_last_word.append(req_state.word_lens_bytes[:-1])
-                print("req_id", req_id, "req_state.word_lens_bytes", req_state.word_lens_bytes)
+                # print("req_id", req_id, "req_state.word_lens_bytes", req_state.word_lens_bytes)
+                
                 # For encoder connector, we need to include the last possibly incomplete word 
                 # the previous worker step for chunked prefills
-                word_lens_bytes_per_task_excl_last_word[-1][0] += len(req_state.curr_word_bytes)
+                # P WE SHOULD NOT DO THIS FOR FIRST CHUNKED PREFILL
+                word_lens_bytes_per_task_excl_last_word[-1][0] += req_state.len_last_word_chunked
+
                 num_bytes_last_word = req_state.word_lens_bytes[-1]
                 byte_positions.append(torch.arange(req_state.byte_position - req_state.len_last_word_chunked,
                                                    req_state.byte_position + req_state.num_scheduled_tokens_byte - num_bytes_last_word,
@@ -594,7 +597,7 @@ class HATManager:
         # from previous worker step
         req_state.len_last_word_chunked = len(req_state.curr_word_bytes)
         req_state.curr_word_bytes = curr_word_bytes
-        print("req_id", cached_req_data.req_id, "req_state.curr_word_bytes", req_state.curr_word_bytes)
+        # print("req_id", cached_req_data.req_id, "req_state.curr_word_bytes", req_state.curr_word_bytes)
 
     def _split_text(self, text_bytes: List[int]) -> List[List[int]]:
         """Splits a text into its constituent words in bytes."""

@@ -540,9 +540,6 @@ class HATEncoderConnector(nn.Module):
         #print("byte positions", byte_positions)
         #print("byte positions_shape", byte_positions.shape)
         
-        print("\n\nInside encoder connector")
-        print("latent_word_embeddings", torch.any(torch.isnan(latent_word_embeddings)))
-        print("encoder_hidden_states", torch.any(torch.isnan(encoder_hidden_states)))
         updated_latent_word_embeddings = self.cross_attention_encoder_connector(
             q_position_ids=word_positions,
             q_input=latent_word_embeddings,
@@ -553,7 +550,7 @@ class HATEncoderConnector(nn.Module):
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k
         )
-        print("updated_latent_word_embeddings", torch.any(torch.isnan(updated_latent_word_embeddings)))
+        # print("updated_latent_word_embeddings", torch.any(torch.isnan(updated_latent_word_embeddings)))
         return updated_latent_word_embeddings
 
     def load_weights(self, weights: Iterable[Tuple[str,
