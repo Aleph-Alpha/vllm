@@ -162,10 +162,10 @@ if __name__ == "__main__":
           gpu_memory_utilization=0.9,
           block_size=256,
           disable_cascade_attn=True,
-          max_num_batched_tokens=105,
+          max_num_batched_tokens=150,
           max_model_len=20000, # Can be set to 100k on A100
-          max_num_seqs=10)
-    outputs = llm.generate([format_llama(p) for p in prompts_4], sampling_params)
+          max_num_seqs=128)
+    outputs = llm.generate([format_llama(p) for p in prompts_32], sampling_params)
     #outputs = llm.generate([p for p in prompts_1], sampling_params)
 
     for output in outputs:
