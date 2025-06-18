@@ -28,6 +28,7 @@ from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
+from vllm.v1.hat.hat_kv_cache import HATKVCacheManager
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -151,15 +152,27 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
-        self.kv_cache_manager = KVCacheManager(
-            kv_cache_config=kv_cache_config,
-            max_model_len=self.max_model_len,
-            enable_caching=self.cache_config.enable_prefix_caching,
-            caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
-            use_eagle=self.use_eagle,
-            log_stats=self.log_stats,
-            enable_kv_cache_events=self.enable_kv_cache_events,
-        )
+        if self.vllm_config.model_config.hf_config.model_type == "hierarchical_autoregressive_transformer":
+            self.kv_cache_manager = HATKVCacheManager(
+                kv_cache_config=kv_cache_config,
+                vllm_config=vllm_config,
+                max_model_len=self.max_model_len,
+                enable_caching=self.cache_config.enable_prefix_caching,
+                caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
+                use_eagle=self.use_eagle,
+                log_stats=self.log_stats,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+            )
+        else:
+            self.kv_cache_manager = KVCacheManager(
+                kv_cache_config=kv_cache_config,
+                max_model_len=self.max_model_len,
+                enable_caching=self.cache_config.enable_prefix_caching,
+                caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
+                use_eagle=self.use_eagle,
+                log_stats=self.log_stats,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+            )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
     def schedule(self) -> SchedulerOutput:

@@ -269,8 +269,8 @@ class HATWorker(WorkerBase):
         
         word_positions_final_decoder, cu_seqlens_q_final_decoder, max_seqlen_q_final_decoder = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
         
-        if self.steps == 10:
-            #exit()
+        if self.steps == 5:
+            # exit()
             pass
         self.steps += 1
         # For decoder we now have

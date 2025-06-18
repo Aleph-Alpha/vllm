@@ -5,7 +5,7 @@ from vllm.sequence import ExecuteModelRequest
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.hat.hat_model_runner import HATModelRunner
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
-from vllm.v1.hat.hat_utils import HATSequenceState, _create_empty_model_runner_output, _create_empty_scheduler_output, safe_list_slice, safe_tensor_slice
+from vllm.v1.hat.hat_utils import HATSequenceState, _create_empty_model_runner_output, _create_empty_scheduler_output, check_byte_for_new_word, safe_list_slice, safe_tensor_slice, split_text
 from vllm.v1.outputs import ModelRunnerOutput
 
 
@@ -56,6 +56,8 @@ class HATManager:
             # We need to split the block table into two for the encoder/decoder and the backbone
             block_table_enc_dec = new_req_data.block_ids[-1:]
             block_table_backbone = new_req_data.block_ids[:-1]
+            # print("\n\nblock_table_enc_dec", block_table_enc_dec)
+            # print("block_table_backbone", block_table_backbone)
             new_req_data.block_ids = block_table_enc_dec
 
             scheduler_output_byte.scheduled_new_reqs.append(new_req_data)
@@ -99,6 +101,9 @@ class HATManager:
             block_table_backbone = cached_req_data.new_block_ids[:-1]
             req_state.block_table_backbone = block_table_backbone
             cached_req_data.new_block_ids = block_table_enc_dec
+            
+            # print("\n\nblock_table_enc_dec", block_table_enc_dec)
+            # print("block_table_backbone", block_table_backbone)
 
             scheduler_output_byte.num_scheduled_tokens[req_id] = num_scheduled_tokens
             scheduler_output_byte.total_num_scheduled_tokens += num_scheduled_tokens
@@ -504,7 +509,7 @@ class HATManager:
             if new_token_id == self.hat_splitter.eot_id:                
                 continue
 
-            is_new_word, words = self._check_byte_for_new_word(curr_word_bytes)
+            is_new_word, words = check_byte_for_new_word(self.hat_splitter, curr_word_bytes)
             if is_new_word:
                 new_word_first_byte = req_state.curr_word_bytes.pop()
                 req_state.new_word_first_bytes = [new_word_first_byte]  
@@ -547,7 +552,7 @@ class HATManager:
             if new_token_id == self.hat_splitter.eot_id:                
                 continue
 
-            is_new_word, words = self._check_byte_for_new_word(curr_word_bytes)
+            is_new_word, words = check_byte_for_new_word(self.hat_splitter, curr_word_bytes)
             if is_new_word:
                 new_word_first_byte = req_state.curr_word_bytes.pop()
                 req_state.new_word_first_bytes = [new_word_first_byte]  
@@ -573,7 +578,7 @@ class HATManager:
         Returns:
             List[int]: wordlens_bytes for the new sequence.
         """
-        text_words_bytes = self._split_text(new_req_data.prompt_token_ids)
+        text_words_bytes = split_text(self.hat_splitter, new_req_data.prompt_token_ids)
         
         word_lens_bytes = [len(text_word_bytes) for text_word_bytes in text_words_bytes]
 
@@ -621,7 +626,7 @@ class HATManager:
         """
         req_state = self.req_ids_to_hat_state[cached_req_data.req_id]
 
-        text_words_bytes = self._split_text(req_state.curr_word_bytes + cached_req_data.new_token_ids)
+        text_words_bytes = split_text(self.hat_splitter, req_state.curr_word_bytes + cached_req_data.new_token_ids)
         
         # word_lens_bytes always only includes characters from this worker step
         word_lens_bytes = [len(text_word_bytes) for text_word_bytes in text_words_bytes]
@@ -635,22 +640,3 @@ class HATManager:
         req_state.len_last_word_chunked = len(req_state.curr_word_bytes)
         req_state.curr_word_bytes = curr_word_bytes
         # print("req_id", cached_req_data.req_id, "req_state.curr_word_bytes", req_state.curr_word_bytes)
-
-    def _split_text(self, text_bytes: List[int]) -> List[List[int]]:
-        """Splits a text into its constituent words in bytes."""
-        text = self.hat_splitter.decode(text_bytes, skip_special_tokens=False)
-        list_of_words_in_bytes = self.hat_splitter.encode(text)
-        return list_of_words_in_bytes
-    
-    def _check_byte_for_new_word(self, word: List[int]) -> Tuple[bool, Optional[List[List[int]]]]:
-        if len(word) > self.hat_splitter.max_word_size:
-           return True, None
-        try:
-            word_str = self.hat_splitter.decode(word, errors="strict", skip_special_tokens=False)
-            w = self.hat_splitter.encode(word_str)
-        except UnicodeDecodeError as e:
-            if "invalid start byte" in e.reason:
-                return True, None
-            else:
-                return False, None
-        return len(w) > 1, w

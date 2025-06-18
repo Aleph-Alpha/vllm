@@ -1,9 +1,10 @@
 from enum import Enum
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import torch
 
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.outputs import ModelRunnerOutput
 
 
@@ -33,6 +34,13 @@ class HATSequenceState:
     word_position: torch.Tensor
     word_position_cpu: int
     byte_position: int
+
+
+@dataclass
+class HATKVCacheState:
+    num_curr_word_bytes: int
+    num_computed_tokens_backbone: int
+    num_computed_tokens_byte: int
 
 
 @dataclass
@@ -103,3 +111,23 @@ def safe_list_slice(list: List, count: int, keep_prefix: bool=True) -> Optional[
                 return list[:-count]
             else:
                 return list[-count:]
+            
+            
+def split_text(hat_splitter: HATRuleSplitter, text_bytes: List[int]) -> List[List[int]]:
+    """Splits a text into its constituent words in bytes."""
+    text = hat_splitter.decode(text_bytes, skip_special_tokens=False)
+    list_of_words_in_bytes = hat_splitter.encode(text)
+    return list_of_words_in_bytes
+
+def check_byte_for_new_word(hat_splitter: HATRuleSplitter, word: List[int]) -> Tuple[bool, Optional[List[List[int]]]]:
+    if len(word) > hat_splitter.max_word_size:
+        return True, None
+    try:
+        word_str = hat_splitter.decode(word, errors="strict", skip_special_tokens=False)
+        w = hat_splitter.encode(word_str)
+    except UnicodeDecodeError as e:
+        if "invalid start byte" in e.reason:
+            return True, None
+        else:
+            return False, None
+    return len(w) > 1, w
