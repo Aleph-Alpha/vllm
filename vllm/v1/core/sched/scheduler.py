@@ -163,6 +163,7 @@ class Scheduler(SchedulerInterface):
                 log_stats=self.log_stats,
                 enable_kv_cache_events=self.enable_kv_cache_events,
             )
+            self.num_lookahead_tokens = vllm_config.model_config.hf_config.max_word_size
         else:
             self.kv_cache_manager = KVCacheManager(
                 kv_cache_config=kv_cache_config,

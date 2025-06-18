@@ -187,7 +187,6 @@ class HATKVCacheManager:
         
         num_tokens_backbone = self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone
         
-        # TODO(P) Make sure to handle this correctly 
         num_tokens_need_slot = min(
             self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte + num_lookahead_tokens,
             self.max_model_len)
