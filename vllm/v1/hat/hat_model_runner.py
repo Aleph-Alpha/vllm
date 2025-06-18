@@ -41,6 +41,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         check_use_alibi, is_pin_memory_available)
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.hat.hat_utils import HATBatchInfo, HATSubmodelRole
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
@@ -86,6 +87,28 @@ class HATModelRunner(GPUModelRunner):
     
     def prepare_forward_pass(self, hat_batch_info: HATBatchInfo):
         self.hat_batch_info = hat_batch_info
+    
+    def register_request(self, new_req_data: NewRequestData) -> None:
+        req_id = new_req_data.req_id
+        sampling_params = new_req_data.sampling_params
+        if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(sampling_params.seed)
+        else:
+            generator = None
+
+        self.requests[req_id] = CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=new_req_data.prompt_token_ids,
+            mm_inputs=new_req_data.mm_inputs,
+            mm_positions=new_req_data.mm_positions,
+            sampling_params=sampling_params,
+            generator=generator,
+            block_ids=new_req_data.block_ids,
+            num_computed_tokens=new_req_data.num_computed_tokens,
+            output_token_ids=[],
+            lora_request=new_req_data.lora_request,
+        )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the create new input batch with the scheduler
@@ -102,13 +125,7 @@ class HATModelRunner(GPUModelRunner):
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
 
-        block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size
-            for kv_cache_group in self.kv_cache_config.kv_cache_groups
-        ]
-
         # L TODO: Check how slow this is later
-        
         req_ids = self.input_batch.req_ids[:]
         for id_ in req_ids:
             self.input_batch.remove_request(id_)

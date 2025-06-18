@@ -804,7 +804,7 @@ class Scheduler(SchedulerInterface):
             # L TODO: Check this later, especially for spec dec
             # Here the assumption is that if multiple tokens are returned, all tokens minus the last one 
             # will have already been computed.
-            request.num_computed_tokens += (len(new_token_ids) - 1)
+            request.num_computed_tokens += max(0, (len(new_token_ids) - 1))
             for num_new, output_token_id in enumerate(new_token_ids, 1):
                 request.append_output_token_ids(output_token_id)
 

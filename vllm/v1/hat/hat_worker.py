@@ -107,7 +107,7 @@ class HATWorker(WorkerBase):
     
     def determine_available_memory(self) -> int:
         # TODO
-        return int(40e9)
+        return int(10e9)
     
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
@@ -168,6 +168,7 @@ class HATWorker(WorkerBase):
 
         self.hat_manager = HATManager(special_token_dict=self.vllm_config.model_config.hf_config.special_token_dict,
                                       max_word_size = self.vllm_config.model_config.hf_config.max_word_size,
+                                      backbone_model_runner=self.backbone_model_runner,
                                       device=self.device,
                                       rank=self.rank,
                                       driver_rank=self.driver_rank)
@@ -218,7 +219,8 @@ class HATWorker(WorkerBase):
 
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
-        # print("\nscheduler output at the start", scheduler_output)
+        #print("########################################\n\n")put)
+        #print("\nscheduler output at the start", scheduler_output)
         
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
         # print("scheduler_output_word", scheduler_output_word)
@@ -232,40 +234,43 @@ class HATWorker(WorkerBase):
         if encoder_hidden_states_enc_dec_loop is not None:
             self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec)
         
-        if len(scheduler_output_word.scheduled_new_reqs) == 0 and len(scheduler_output_word.scheduled_cached_reqs) == 0:
+        if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) == 0 and len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) == 0:
             # print("\noutput after decode loop", self.hat_manager.output)
             output = self.hat_manager.output
             self.hat_manager.reset_manager()
             return output
 
-        encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
-            self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
-        )
-        # print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector)
-        # print("word_lens_bytes_per_task_excl_last_word", word_lens_bytes_per_task_excl_last_word)
-        # print("byte_positions", byte_positions)
-        # print("word_positions", word_positions)
-        #print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector.shape)
-        #print("byte_positions", byte_positions.shape)
-        #print("word_positions", word_positions.shape)
-        #print("word_lens_bytes_per_task_excl_last_word", word_lens_bytes_per_task_excl_last_word.shape)
+        predictive_word_embeddings = None
+        if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
+            encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
+                self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
+            )
+            # print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector)
+            # print("word_lens_bytes_per_task_excl_last_word", word_lens_bytes_per_task_excl_last_word)
+            # print("byte_positions", byte_positions)
+            # print("word_positions", word_positions)
+            #print("encoder_hidden_states_encoder_connector", encoder_hidden_states_encoder_connector.shape)
+            #print("byte_positions", byte_positions.shape)
+            #print("word_positions", word_positions.shape)
+            #print("word_lens_bytes_per_task_excl_last_word", word_lens_bytes_per_task_excl_last_word.shape)
 
-        updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
-                                                                byte_positions,
-                                                                word_positions,
-                                                                word_lens_bytes_per_task_excl_last_word)
-        
-        self.backbone_model_runner.prepare_forward_pass(HATBatchInfo(latent_word_embeddings=updated_latent_word_embeddings))
-        #print("scheduler_output_word", scheduler_output_word)
-        predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output_word)
+            updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
+                                                                    byte_positions,
+                                                                    word_positions,
+                                                                    word_lens_bytes_per_task_excl_last_word)
+            
+            self.backbone_model_runner.prepare_forward_pass(HATBatchInfo(latent_word_embeddings=updated_latent_word_embeddings))
+            #print("scheduler_output_word", scheduler_output_word)
+            predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output_word)
+
         # print("predictive_word_embeddings", predictive_word_embeddings)
-        predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_word, predictive_word_embeddings)
+        predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_byte_final_decoder, predictive_word_embeddings)
         self.hat_manager.update_backbone_info(scheduler_output_word)
         
-        word_positions_final_decoder, cu_seqlens_q_final_decoder, max_seqlen_q_final_decoder = self.hat_manager.prepare_input_final_decoder(scheduler_output_word)
+        word_positions_final_decoder, cu_seqlens_q_final_decoder, max_seqlen_q_final_decoder = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
         
-        if self.steps == 2:
-            # exit()
+        if self.steps == 10:
+            #exit()
             pass
         self.steps += 1
         # For decoder we now have

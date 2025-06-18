@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from vllm.sequence import ExecuteModelRequest
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+from vllm.v1.hat.hat_model_runner import HATModelRunner
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.hat.hat_utils import HATSequenceState, _create_empty_model_runner_output, _create_empty_scheduler_output, safe_list_slice, safe_tensor_slice
 from vllm.v1.outputs import ModelRunnerOutput
@@ -10,9 +11,16 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 class HATManager:
 
-    def __init__(self, special_token_dict: Dict[str, int], max_word_size: int, device: torch.device, rank: int, driver_rank: int):
+    def __init__(self, 
+                 special_token_dict: Dict[str, int],
+                 max_word_size: int,
+                 backbone_model_runner: HATModelRunner,
+                 device: torch.device,
+                 rank: int,
+                 driver_rank: int):
         self.req_ids_to_hat_state: Dict[str, HATSequenceState] = {}
         self.hat_splitter = HATRuleSplitter(special_token_dict, max_word_size=max_word_size)
+        self.backbone_model_runner = backbone_model_runner
         self.device = device
         self.rank = rank
         self.driver_rank = driver_rank
@@ -66,9 +74,16 @@ class HATManager:
                 num_computed_tokens=0,
                 lora_request=new_req_data.lora_request,
             )
-            scheduler_output_word.scheduled_new_reqs.append(new_req_data_backbone)
-            scheduler_output_word.num_scheduled_tokens[req_id] = num_scheduled_tokens_backbone
-            scheduler_output_word.total_num_scheduled_tokens += num_scheduled_tokens_backbone
+
+            if num_scheduled_tokens_backbone > 0:
+                scheduler_output_word.scheduled_new_reqs.append(new_req_data_backbone)
+                scheduler_output_word.num_scheduled_tokens[req_id] = num_scheduled_tokens_backbone
+                scheduler_output_word.total_num_scheduled_tokens += num_scheduled_tokens_backbone
+            else:
+                # Need to manually register new requests that only contain an incomplete words with the backbone model runner
+                # Because after the first step we will always get a CachedRequestState so the backbone model runner would not know
+                # about it yet
+                self.backbone_model_runner.register_request(new_req_data_backbone)
         
         decode_cached_reqs_not_word_boundary = []
         decode_cached_reqs_word_boundary = []
@@ -99,6 +114,7 @@ class HATManager:
                 word_lens_bytes = self.req_ids_to_hat_state[req_id].word_lens_bytes
 
                 num_scheduled_tokens_backbone = len(word_lens_bytes) - 1
+                req_state.num_scheduled_tokens_backbone = num_scheduled_tokens_backbone
                 cached_req_data_backbone = CachedRequestData(
                     req_id=req_id,
                     resumed_from_preemption=cached_req_data.resumed_from_preemption,
@@ -107,9 +123,11 @@ class HATManager:
                     num_computed_tokens=self.req_ids_to_hat_state[req_id].num_computed_tokens_backbone,
                 )
 
-                scheduler_output_word.scheduled_cached_reqs.append(cached_req_data_backbone)
-                scheduler_output_word.num_scheduled_tokens[req_id] = num_scheduled_tokens_backbone
-                scheduler_output_word.total_num_scheduled_tokens += num_scheduled_tokens_backbone
+                if num_scheduled_tokens_backbone > 0:
+                    scheduler_output_word.scheduled_cached_reqs.append(cached_req_data_backbone)
+                    scheduler_output_word.num_scheduled_tokens[req_id] = num_scheduled_tokens_backbone
+                    scheduler_output_word.total_num_scheduled_tokens += num_scheduled_tokens_backbone
+
                 scheduler_output_word.finished_req_ids = scheduler_output.finished_req_ids
             elif len(req_state.new_word_first_bytes) > 0:
                 self.req_ids_to_hat_state[req_id].word_lens_bytes = [1]
@@ -177,22 +195,30 @@ class HATManager:
             req_id = scheduled_req.req_id
             word_lens_bytes = self.req_ids_to_hat_state[req_id].word_lens_bytes
             req_state = self.req_ids_to_hat_state[req_id]
+            # Case where we have a sequence shorter than a full word
             if req_state.is_partial_prefill:
-                # We remove the overcounting in word_len_bytes due to the last computed work in the previous chunked prefill 
-                num_bytes_excl_last_word = sum(word_lens_bytes[:-1])
-                encoder_hidden_states_encoder_connector.extend(self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word)
-                encoder_hidden_states_encoder_connector.append(
-                    encoder_hidden_states[offset_beginning:offset_beginning+num_bytes_excl_last_word, :]
-                )
-                offset += num_bytes_excl_last_word
+                num_bytes_excl_last_word = 0
+                if req_state.num_scheduled_tokens_backbone > 0:
+                    # We remove the overcounting in word_len_bytes due to the last computed work in the previous chunked prefill 
+                    num_bytes_excl_last_word = sum(word_lens_bytes[:-1])
+                    encoder_hidden_states_encoder_connector.extend(self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word)
+                    encoder_hidden_states_encoder_connector.append(
+                        encoder_hidden_states[offset_beginning:offset_beginning+num_bytes_excl_last_word, :]
+                    )
+                    offset += num_bytes_excl_last_word
 
-                self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word = [
-                    encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
-                ]
+                    self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word = [
+                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
+                    ]
+                else:
+                    self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
+                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
+                    )
+                    
                 offset += word_lens_bytes[-1]
                 offset_beginning += num_bytes_excl_last_word + word_lens_bytes[-1]
                 
-                if req_state.num_computed_tokens_backbone == 0:
+                if isinstance(scheduled_req, NewRequestData):
                     scheduler_output_byte_final_decoder.scheduled_new_reqs.append(scheduled_req)
                 else:
                     scheduler_output_byte_final_decoder.scheduled_cached_reqs.append(scheduled_req)
@@ -200,7 +226,28 @@ class HATManager:
                 scheduler_output_byte_final_decoder.num_scheduled_tokens[req_id] = req_state.num_scheduled_tokens_byte
                 scheduler_output_byte_final_decoder.total_num_scheduled_tokens += req_state.num_scheduled_tokens_byte
                 scheduler_output_byte_final_decoder.finished_req_ids = scheduler_output_byte.finished_req_ids
-            elif len(word_lens_bytes)== 1 and word_lens_bytes[0] == 1:
+            elif req_state.is_prefill:
+                num_bytes_excl_last_word = sum(word_lens_bytes[:-1])
+                offset += num_bytes_excl_last_word
+                self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
+                    encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
+                )
+
+                if req_state.num_scheduled_tokens_backbone > 0:
+                    encoder_hidden_states_encoder_connector.append(
+                        encoder_hidden_states[offset_beginning:offset_beginning+num_bytes_excl_last_word, :]
+                    )
+                else:
+                    assert num_bytes_excl_last_word == 0
+
+                offset += word_lens_bytes[-1]
+                offset_beginning += num_bytes_excl_last_word + word_lens_bytes[-1]
+                
+                scheduler_output_byte_final_decoder.scheduled_new_reqs.append(scheduled_req)
+                scheduler_output_byte_final_decoder.num_scheduled_tokens[req_id] = req_state.num_scheduled_tokens_byte
+                scheduler_output_byte_final_decoder.total_num_scheduled_tokens += req_state.num_scheduled_tokens_byte
+                scheduler_output_byte_final_decoder.finished_req_ids = scheduler_output_byte.finished_req_ids
+            else:
                 assert isinstance(scheduled_req, CachedRequestData)
 
                 # Decodes that at the start of the loop already reached word boundary do not
@@ -228,24 +275,7 @@ class HATManager:
                     
                 decodes += 1
                 offset += 1
-                offset_beginning += 1
-            else:
-                num_bytes_excl_last_word = sum(word_lens_bytes[:-1])
-                offset += num_bytes_excl_last_word
-                self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
-                    encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
-                )
-
-                encoder_hidden_states_encoder_connector.append(
-                    encoder_hidden_states[offset_beginning:offset_beginning+num_bytes_excl_last_word, :]
-                )
-                offset += word_lens_bytes[-1]
-                offset_beginning += num_bytes_excl_last_word + word_lens_bytes[-1]
-                
-                scheduler_output_byte_final_decoder.scheduled_new_reqs.append(scheduled_req)
-                scheduler_output_byte_final_decoder.num_scheduled_tokens[req_id] = req_state.num_scheduled_tokens_byte
-                scheduler_output_byte_final_decoder.total_num_scheduled_tokens += req_state.num_scheduled_tokens_byte
-                scheduler_output_byte_final_decoder.finished_req_ids = scheduler_output_byte.finished_req_ids
+                offset_beginning += 1                
         
         if len(encoder_hidden_states_enc_dec_loop) > 0:
             encoder_hidden_states_enc_dec_loop = torch.cat(encoder_hidden_states_enc_dec_loop, dim=0)
@@ -299,7 +329,13 @@ class HATManager:
                 word_positions.append(torch.arange(req_state.word_position_cpu,
                                                    req_state.word_position_cpu + scheduler_output_word.num_scheduled_tokens[req_id],
                                                    device=self.device))
-            elif len(req_state.word_lens_bytes) == 1 and req_state.word_lens_bytes[0] == 1:
+            elif req_state.is_prefill:
+                # word_lens_bytes_per_task.append(req_state.word_lens_bytes)
+                num_bytes_last_word = req_state.word_lens_bytes[-1]
+                word_lens_bytes_per_task_excl_last_word.append(req_state.word_lens_bytes[:-1])
+                byte_positions.append(torch.arange(0, req_state.num_scheduled_tokens_byte - num_bytes_last_word, device=self.device))
+                word_positions.append(torch.arange(0, scheduler_output_word.num_scheduled_tokens[req_id], device=self.device))
+            else:
                 # word_len_bytes_per_task only needed for final decoder
                 word_lens_bytes_per_task_excl_last_word.append([len(req_state.curr_word_bytes)])
                 byte_positions.append(torch.arange(req_state.byte_position - len(req_state.curr_word_bytes),
@@ -307,13 +343,7 @@ class HATManager:
                                                    device=self.device))
                 word_positions.append(req_state.word_position)
                 
-                encoder_hidden_states_encoder_connector.extend(req_state.encoder_embeds_curr_word)
-            else:
-                # word_lens_bytes_per_task.append(req_state.word_lens_bytes)
-                num_bytes_last_word = req_state.word_lens_bytes[-1]
-                word_lens_bytes_per_task_excl_last_word.append(req_state.word_lens_bytes[:-1])
-                byte_positions.append(torch.arange(0, req_state.num_scheduled_tokens_byte - num_bytes_last_word, device=self.device))
-                word_positions.append(torch.arange(0, scheduler_output_word.num_scheduled_tokens[req_id], device=self.device))
+                encoder_hidden_states_encoder_connector.extend(req_state.encoder_embeds_curr_word)                
 
         # Assume for now that all decodes finish at a word boundary
         encoder_hidden_states_encoder_connector = torch.cat(encoder_hidden_states_encoder_connector, dim=0)
@@ -325,17 +355,19 @@ class HATManager:
 
         return encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions
     
-    def handle_backbone_output(self, scheduler_output_word: SchedulerOutput,
+    def handle_backbone_output(self, scheduler_output_byte_final_decoder: SchedulerOutput,
                                predictive_word_embeddings: torch.Tensor) -> torch.Tensor:
         # L TODO: self.num_decodes might not be correct here when we later run for a static num of bytes
-        predictive_word_embeddings_decodes = safe_tensor_slice(predictive_word_embeddings,
-                                                               self.num_decodes_word_boundary,
-                                                               keep_prefix=False).clone()
+        predictive_word_embeddings_decodes = None
+        if predictive_word_embeddings is not None:
+            predictive_word_embeddings_decodes = safe_tensor_slice(predictive_word_embeddings,
+                                                                self.num_decodes_word_boundary,
+                                                                keep_prefix=False).clone()
         predictive_word_embeddings_final_decoder = []
 
         num_decodes = 0
         offset = 0
-        for scheduled_req in scheduler_output_word.scheduled_new_reqs + scheduler_output_word.scheduled_cached_reqs:
+        for scheduled_req in scheduler_output_byte_final_decoder.scheduled_new_reqs + scheduler_output_byte_final_decoder.scheduled_cached_reqs:
             req_id = scheduled_req.req_id
             req_state = self.req_ids_to_hat_state[req_id]
             if req_state.is_partial_prefill:
@@ -343,49 +375,51 @@ class HATManager:
                 
                 # For first chunked prefill we append first word embedding
                 # If not, we append the previous predicted word embedding from previous worker step
-                if req_state.num_computed_tokens_backbone == 0:
-                    predictive_word_embeddings_final_decoder.append(self.first_word_embedding)
-                else:
-                    predictive_word_embeddings_final_decoder.append(req_state.prev_pred_backbone_embedding)
-                predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset:offset+num_words_excl_last_word, :])
+                predictive_word_embeddings_final_decoder.append(req_state.prev_pred_backbone_embedding)
+                    
+                if req_state.num_scheduled_tokens_backbone > 0:
+                    predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset:offset+num_words_excl_last_word, :])
+                    
+                    offset += num_words_excl_last_word
+                    req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
+                    
+            elif req_state.is_prefill:
+                num_words_excl_last_word = len(req_state.word_lens_bytes) - 1
+                predictive_word_embeddings_final_decoder.append(self.first_word_embedding)
                 
-                offset += num_words_excl_last_word
-                req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
+                if req_state.num_scheduled_tokens_backbone > 0:
+                    predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset:offset+num_words_excl_last_word, :])
+                
+                    offset += num_words_excl_last_word
+                    req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
                  
-            elif len(req_state.word_lens_bytes) == 1 and req_state.word_lens_bytes[0] == 1:
+            else:
                 req_state.prev_pred_backbone_embedding = predictive_word_embeddings_decodes[num_decodes, :].unsqueeze(0)
                 predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset, :].unsqueeze(0))
                 num_decodes += 1
                 offset += 1
-            else:
-                num_words_excl_last_word = len(req_state.word_lens_bytes) - 1
-                predictive_word_embeddings_final_decoder.append(self.first_word_embedding)
-                predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset:offset+num_words_excl_last_word, :])
                 
-                offset += num_words_excl_last_word
-                req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
                 
         predictive_word_embeddings_final_decoder = torch.cat(predictive_word_embeddings_final_decoder, dim=0)
         return predictive_word_embeddings_final_decoder
     
-    def prepare_input_final_decoder(self, scheduler_output_word: SchedulerOutput) -> torch.Tensor: 
+    def prepare_input_final_decoder(self, scheduler_output_byte_final_decoder: SchedulerOutput) -> torch.Tensor: 
         word_positions = []
         word_lens_bytes_per_task = [[0]]
-        for scheduled_req in scheduler_output_word.scheduled_new_reqs + scheduler_output_word.scheduled_cached_reqs:
+        for scheduled_req in scheduler_output_byte_final_decoder.scheduled_new_reqs + scheduler_output_byte_final_decoder.scheduled_cached_reqs:
             req_id = scheduled_req.req_id
             req_state = self.req_ids_to_hat_state[req_id]
             
             if req_state.is_partial_prefill:
                 word_positions.append(torch.arange(req_state.word_position_cpu,
-                                                   req_state.word_position_cpu + scheduler_output_word.num_scheduled_tokens[req_id] + 1,
+                                                   req_state.word_position_cpu + req_state.num_scheduled_tokens_backbone + 1,
+                                                   device=self.device))
+            elif req_state.is_prefill:
+                word_positions.append(torch.arange(0, req_state.num_scheduled_tokens_backbone + 1,
                                                    device=self.device))
             # Decodes that reached the word boundary in the previous worker step
-            elif len(req_state.word_lens_bytes) == 1 and req_state.word_lens_bytes[0] == 1:
-                word_positions.append(req_state.word_position)
             else:
-                word_positions.append(torch.arange(0,
-                                                   scheduler_output_word.num_scheduled_tokens[req_id] + 1,
-                                                   device=self.device))
+                word_positions.append(req_state.word_position)
 
             word_lens_bytes_per_task.append(req_state.word_lens_bytes)
             
@@ -411,7 +445,8 @@ class HATManager:
 
     def compute_position_ids_decoder_autoregressive_phase(self, 
                                                           scheduler_output_byte_enc_dec: SchedulerOutput) -> torch.Tensor:
-        tensors = [self.req_ids_to_hat_state[scheduled_req.req_id].word_position for scheduled_req in scheduler_output_byte_enc_dec.scheduled_cached_reqs]
+        tensors = [self.req_ids_to_hat_state[scheduled_req.req_id].word_position
+                   for scheduled_req in scheduler_output_byte_enc_dec.scheduled_cached_reqs]
         return torch.hstack(tensors)
                     
     def update_backbone_info(self, scheduler_output_word: SchedulerOutput):
@@ -446,18 +481,18 @@ class HATManager:
 
             new_token_id = None
             # If we are in prefill case or last chunked prefill 
-            if not req_state.is_partial_prefill or req_state.num_prompt_tokens==(req_state.num_scheduled_tokens_byte+scheduled_req.num_computed_tokens): 
+            if not req_state.is_partial_prefill or req_state.num_prompt_tokens == (req_state.num_scheduled_tokens_byte + scheduled_req.num_computed_tokens): 
                 req_id_index_step = model_runner_output.req_id_to_index[req_id]
                 sampled_token_ids: List[int] = model_runner_output.sampled_token_ids[req_id_index_step]
                 new_token_id = sampled_token_ids[0]
                 self.output.sampled_token_ids[-1].append(new_token_id)
                 req_state.is_partial_prefill = False
+                req_state.is_prefill = False
 
-            num_scheduled_tokens_backbone = len(req_state.word_lens_bytes) - 1
             req_state.byte_position += req_state.num_scheduled_tokens_byte
-            req_state.word_position += num_scheduled_tokens_backbone
-            req_state.word_position_cpu += num_scheduled_tokens_backbone
-            req_state.num_computed_tokens_backbone += num_scheduled_tokens_backbone
+            req_state.word_position += req_state.num_scheduled_tokens_backbone
+            req_state.word_position_cpu += req_state.num_scheduled_tokens_backbone
+            req_state.num_computed_tokens_backbone += req_state.num_scheduled_tokens_backbone
 
             if req_state.is_partial_prefill:
                 continue
@@ -560,13 +595,15 @@ class HATManager:
             curr_word_bytes=curr_word_bytes,
             new_word_first_bytes=[],
             is_partial_prefill=is_partial_prefill,
+            is_prefill=True,
             num_prompt_tokens=len(new_req_data.prompt_token_ids),
             num_computed_tokens_backbone=0,
             num_scheduled_tokens_byte=num_scheduled_tokens,
+            num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,
             block_table_backbone=[],
             len_last_word_chunked=0,
             word_lens_bytes=word_lens_bytes,
-            prev_pred_backbone_embedding=None,
+            prev_pred_backbone_embedding=self.first_word_embedding,
             encoder_embeds_curr_word=[],
             encoder_embeds_new_word=[],
             word_position=torch.tensor(0, dtype=torch.int64, device=self.device),

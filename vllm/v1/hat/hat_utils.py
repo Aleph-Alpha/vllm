@@ -13,8 +13,10 @@ class HATSequenceState:
     curr_word_bytes: List[int]
     new_word_first_bytes: Optional[List[int]]
     is_partial_prefill: bool
+    is_prefill: bool
     num_prompt_tokens: int
     num_computed_tokens_backbone: int
+    num_scheduled_tokens_backbone: int
     block_table_backbone: List[List[int]]
     word_lens_bytes: List[int]
     num_scheduled_tokens_byte: int
