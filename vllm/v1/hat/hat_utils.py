@@ -44,7 +44,7 @@ class HATKVCacheState:
 
 
 @dataclass
-class HATBatchInfo:
+class HATBatchInput:
     word_positions: Optional[torch.Tensor] = None
     cu_seqlen_byte: Optional[torch.Tensor] = None
     max_seqlen_byte: Optional[int] = None
@@ -118,6 +118,7 @@ def split_text(hat_splitter: HATRuleSplitter, text_bytes: List[int]) -> List[Lis
     text = hat_splitter.decode(text_bytes, skip_special_tokens=False)
     list_of_words_in_bytes = hat_splitter.encode(text)
     return list_of_words_in_bytes
+
 
 def check_byte_for_new_word(hat_splitter: HATRuleSplitter, word: List[int]) -> Tuple[bool, Optional[List[List[int]]]]:
     if len(word) > hat_splitter.max_word_size:

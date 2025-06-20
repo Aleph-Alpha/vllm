@@ -42,7 +42,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.hat.hat_utils import HATBatchInfo, HATSubmodelRole
+from vllm.v1.hat.hat_utils import HATBatchInput, HATSubmodelRole
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
                                         SlidingWindowSpec)
@@ -72,15 +72,12 @@ class HATModelRunner(GPUModelRunner):
 
     def __init__( self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        self.type: Optional[HATSubmodelRole] = None
-        self.hat_batch_info: Optional[HATBatchInfo] = None
+        self.role: Optional[HATSubmodelRole] = None
     
     def load_model(self) -> None:
         super().load_model()
-        self._set_type()
+        self._set_role()
 
-    def prepare_forward_pass(self, hat_batch_info: HATBatchInfo):
-        self.hat_batch_info = hat_batch_info
     
     def register_request(self, new_req_data: NewRequestData) -> None:
         req_id = new_req_data.req_id
@@ -234,6 +231,7 @@ class HATModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        hat_batch_input: Optional[HATBatchInput] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, torch.Tensor]:
 
         self._update_states(scheduler_output)
@@ -279,7 +277,7 @@ class HATModelRunner(GPUModelRunner):
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
 
-        model_kwargs = self._get_model_kwargs(input_ids, positions, num_scheduled_tokens)
+        model_kwargs = self._get_model_kwargs(input_ids, positions, num_scheduled_tokens, hat_batch_input)
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
@@ -309,7 +307,7 @@ class HATModelRunner(GPUModelRunner):
             get_pp_group().send_tensor_dict(hidden_states.tensors,
                                             all_gather_group=get_tp_group())
             logits = None
-        elif self.type == HATSubmodelRole.DECODER:
+        elif self.role == HATSubmodelRole.DECODER:
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
         else:
@@ -394,8 +392,11 @@ class HATModelRunner(GPUModelRunner):
             finished_recving=finished_recving,
         )
         
-    def _get_model_kwargs(self, input_ids: torch.Tensor, positions: torch.Tensor, num_scheduled_tokens: int) -> dict[str, Any]:
-        match self.type:
+    def _get_model_kwargs(self, input_ids: torch.Tensor,
+                          positions: torch.Tensor,
+                          num_scheduled_tokens: int,
+                          hat_batch_input: Optional[HATBatchInput] = None) -> dict[str, Any]:
+        match self.role:
             case HATSubmodelRole.ENCODER:
                 model_kwargs = {
                     "input_ids": input_ids,
@@ -408,7 +409,7 @@ class HATModelRunner(GPUModelRunner):
                     "input_ids": None,
                     "inputs_embeds": None,
                     "positions": positions,
-                    "previous_hidden_states": self.hat_batch_info.latent_word_embeddings,
+                    "previous_hidden_states": hat_batch_input.latent_word_embeddings,
                     "intermediate_tensors": None,
                 }
             case HATSubmodelRole.DECODER:
@@ -416,22 +417,22 @@ class HATModelRunner(GPUModelRunner):
                         and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
                     model_kwargs = {
                         # Reuse input_ids for word positions, because the decoder does not need input_ids
-                        "input_ids": self.hat_batch_info.word_positions,
+                        "input_ids": hat_batch_input.word_positions,
                         "inputs_embeds": None,
                         "positions": positions,
-                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
+                        "previous_hidden_states": hat_batch_input.encoder_hidden_states,
                         "intermediate_tensors": None,
                     }
                 else:
                     model_kwargs = {
                         # Reuse input_ids for word positions, because the decoder does not need input_ids
-                        "input_ids": self.hat_batch_info.word_positions,
+                        "input_ids": hat_batch_input.word_positions,
                         "inputs_embeds": None,
                         "positions": positions,
-                        "cu_seqlens_byte": self.hat_batch_info.cu_seqlen_byte,
-                        "max_seqlen_byte": self.hat_batch_info.max_seqlen_byte,
-                        "predictive_word_embeddings": self.hat_batch_info.predictive_word_embeddings,
-                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
+                        "cu_seqlens_byte": hat_batch_input.cu_seqlen_byte,
+                        "max_seqlen_byte": hat_batch_input.max_seqlen_byte,
+                        "predictive_word_embeddings": hat_batch_input.predictive_word_embeddings,
+                        "previous_hidden_states": hat_batch_input.encoder_hidden_states,
                         "intermediate_tensors": None,
                     }
         return model_kwargs
@@ -447,12 +448,12 @@ class HATModelRunner(GPUModelRunner):
         self.may_reinitialize_input_batch(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
     
-    def _set_type(self) -> None:
+    def _set_role(self) -> None:
         if isinstance(self.model, HATEncoderForCausalLM):
-            self.type = HATSubmodelRole.ENCODER
+            self.role = HATSubmodelRole.ENCODER
         elif isinstance(self.model, HATDecoderForCausalLM):
-            self.type = HATSubmodelRole.DECODER
+            self.role = HATSubmodelRole.DECODER
         elif isinstance(self.model, HATBackboneForCausalLM):
-            self.type = HATSubmodelRole.BACKBONE
+            self.role = HATSubmodelRole.BACKBONE
         else:
-            raise ValueError(f"Unknown HAT model type: {type(self.model)}. Can't instantiate HATModelRunner.")
+            raise ValueError(f"Unknown HAT model role: {type(self.model)}. Can't instantiate HATModelRunner.")
