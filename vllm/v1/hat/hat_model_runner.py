@@ -74,17 +74,11 @@ class HATModelRunner(GPUModelRunner):
         super().__init__(vllm_config, device)
         self.type: Optional[HATSubmodelRole] = None
         self.hat_batch_info: Optional[HATBatchInfo] = None
-
-    def _set_type(self) -> None:
-        if isinstance(self.model, HATEncoderForCausalLM):
-            self.type = HATSubmodelRole.ENCODER
-        elif isinstance(self.model, HATDecoderForCausalLM):
-            self.type = HATSubmodelRole.DECODER
-        elif isinstance(self.model, HATBackboneForCausalLM):
-            self.type = HATSubmodelRole.BACKBONE
-        else:
-            raise ValueError(f"Unknown HAT model type: {type(self.model)}. Can't instantiate HATModelRunner.")
     
+    def load_model(self) -> None:
+        super().load_model()
+        self._set_type()
+
     def prepare_forward_pass(self, hat_batch_info: HATBatchInfo):
         self.hat_batch_info = hat_batch_info
     
@@ -242,9 +236,6 @@ class HATModelRunner(GPUModelRunner):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, torch.Tensor]:
 
-        if self.type is None:
-            self._set_type()
-
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -288,47 +279,7 @@ class HATModelRunner(GPUModelRunner):
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
 
-
-        match self.type:
-            case HATSubmodelRole.ENCODER:
-                model_kwargs = {
-                    "input_ids": input_ids,
-                    "inputs_embeds": None,
-                    "positions": positions,
-                    "intermediate_tensors": None,
-                }
-            case HATSubmodelRole.BACKBONE:
-                model_kwargs = {
-                    "input_ids": None,
-                    "inputs_embeds": None,
-                    "positions": positions,
-                    "previous_hidden_states": self.hat_batch_info.latent_word_embeddings,
-                    "intermediate_tensors": None,
-                }
-            case HATSubmodelRole.DECODER:
-                if (self.use_cuda_graph
-                        and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
-                    model_kwargs = {
-                        # Reuse input_ids for word positions, because the decoder does not need input_ids
-                        "input_ids": self.hat_batch_info.word_positions,
-                        "inputs_embeds": None,
-                        "positions": positions,
-                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
-                        "intermediate_tensors": None,
-                    }
-                else:
-                    model_kwargs = {
-                        # Reuse input_ids for word positions, because the decoder does not need input_ids
-                        "input_ids": self.hat_batch_info.word_positions,
-                        "inputs_embeds": None,
-                        "positions": positions,
-                        "cu_seqlens_q": self.hat_batch_info.cu_seqlen_words,
-                        "max_seqlen_q": self.hat_batch_info.max_seqlen_words,
-                        "predictive_word_embeddings": self.hat_batch_info.predictive_word_embeddings,
-                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
-                        "intermediate_tensors": None,
-                    }
-
+        model_kwargs = self._get_model_kwargs(input_ids, positions, num_scheduled_tokens)
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
@@ -443,6 +394,48 @@ class HATModelRunner(GPUModelRunner):
             finished_recving=finished_recving,
         )
         
+    def _get_model_kwargs(self, input_ids: torch.Tensor, positions: torch.Tensor, num_scheduled_tokens: int) -> dict[str, Any]:
+        match self.type:
+            case HATSubmodelRole.ENCODER:
+                model_kwargs = {
+                    "input_ids": input_ids,
+                    "inputs_embeds": None,
+                    "positions": positions,
+                    "intermediate_tensors": None,
+                }
+            case HATSubmodelRole.BACKBONE:
+                model_kwargs = {
+                    "input_ids": None,
+                    "inputs_embeds": None,
+                    "positions": positions,
+                    "previous_hidden_states": self.hat_batch_info.latent_word_embeddings,
+                    "intermediate_tensors": None,
+                }
+            case HATSubmodelRole.DECODER:
+                if (self.use_cuda_graph
+                        and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
+                    model_kwargs = {
+                        # Reuse input_ids for word positions, because the decoder does not need input_ids
+                        "input_ids": self.hat_batch_info.word_positions,
+                        "inputs_embeds": None,
+                        "positions": positions,
+                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
+                        "intermediate_tensors": None,
+                    }
+                else:
+                    model_kwargs = {
+                        # Reuse input_ids for word positions, because the decoder does not need input_ids
+                        "input_ids": self.hat_batch_info.word_positions,
+                        "inputs_embeds": None,
+                        "positions": positions,
+                        "cu_seqlens_byte": self.hat_batch_info.cu_seqlen_byte,
+                        "max_seqlen_byte": self.hat_batch_info.max_seqlen_byte,
+                        "predictive_word_embeddings": self.hat_batch_info.predictive_word_embeddings,
+                        "previous_hidden_states": self.hat_batch_info.encoder_hidden_states,
+                        "intermediate_tensors": None,
+                    }
+        return model_kwargs
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -454,3 +447,12 @@ class HATModelRunner(GPUModelRunner):
         self.may_reinitialize_input_batch(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
     
+    def _set_type(self) -> None:
+        if isinstance(self.model, HATEncoderForCausalLM):
+            self.type = HATSubmodelRole.ENCODER
+        elif isinstance(self.model, HATDecoderForCausalLM):
+            self.type = HATSubmodelRole.DECODER
+        elif isinstance(self.model, HATBackboneForCausalLM):
+            self.type = HATSubmodelRole.BACKBONE
+        else:
+            raise ValueError(f"Unknown HAT model type: {type(self.model)}. Can't instantiate HATModelRunner.")

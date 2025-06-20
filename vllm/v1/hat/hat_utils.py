@@ -46,8 +46,8 @@ class HATKVCacheState:
 @dataclass
 class HATBatchInfo:
     word_positions: Optional[torch.Tensor] = None
-    cu_seqlen_words: Optional[torch.Tensor] = None
-    max_seqlen_words: Optional[int] = None
+    cu_seqlen_byte: Optional[torch.Tensor] = None
+    max_seqlen_byte: Optional[int] = None
     predictive_word_embeddings: Optional[torch.Tensor] = None
     latent_word_embeddings: Optional[torch.Tensor] = None
     encoder_hidden_states: Optional[torch.Tensor] = None

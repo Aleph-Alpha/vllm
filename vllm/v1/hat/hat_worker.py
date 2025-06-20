@@ -273,17 +273,12 @@ class HATWorker(WorkerBase):
             # exit()
             pass
         self.steps += 1
-        # For decoder we now have
-        # scheduler_output_byte_final_decoder
-        # predictive_word_embeddings_final_decoder
-        # encoder_hidden_states_final_decoder
-        # word_positions_final_decoder
         
         hat_batch_info_final_decoder = HATBatchInfo(predictive_word_embeddings=predictive_word_embeddings_final_decoder,
                                                     word_positions=word_positions_final_decoder,
                                                     encoder_hidden_states=encoder_hidden_states_final_decoder,
-                                                    cu_seqlen_words=cu_seqlens_q_final_decoder,
-                                                    max_seqlen_words=max_seqlen_q_final_decoder)
+                                                    cu_seqlen_byte=cu_seqlens_q_final_decoder,
+                                                    max_seqlen_byte=max_seqlen_q_final_decoder)
         self.decoder_model_runner.prepare_forward_pass(hat_batch_info_final_decoder)
         model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_final_decoder)
         
@@ -329,12 +324,12 @@ class HATWorker(WorkerBase):
         word_positions = self.hat_manager.compute_position_ids_decoder_autoregressive_phase(scheduler_output)
         
         hat_batch_info = HATBatchInfo(predictive_word_embeddings=predictive_word_embeddings,
-                                        word_positions=word_positions,
-                                        encoder_hidden_states=encoder_hidden_states,
-                                        cu_seqlen_words=torch.arange(word_positions.shape[0]+1, 
-                                                                    device=self.device,
-                                                                    dtype=torch.int32),
-                                        max_seqlen_words=1)
+                                      word_positions=word_positions,
+                                      encoder_hidden_states=encoder_hidden_states,
+                                      cu_seqlen_byte=torch.arange(word_positions.shape[0]+1, 
+                                                                  device=self.device,
+                                                                  dtype=torch.int32),
+                                      max_seqlen_byte=1)
         self.decoder_model_runner.prepare_forward_pass(hat_batch_info)
         model_runner_output = self.decoder_worker.execute_model(scheduler_output)
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
@@ -349,10 +344,10 @@ class HATWorker(WorkerBase):
             hat_batch_info = HATBatchInfo(predictive_word_embeddings=predictive_word_embeddings,
                                           word_positions=word_positions,
                                           encoder_hidden_states=encoder_hidden_states,
-                                          cu_seqlen_words=torch.arange(word_positions.shape[0]+1, 
-                                                                       device=self.device,
-                                                                       dtype=torch.int32),
-                                          max_seqlen_words=1)
+                                          cu_seqlen_byte=torch.arange(word_positions.shape[0]+1, 
+                                                                      device=self.device,
+                                                                      dtype=torch.int32),
+                                          max_seqlen_byte=1)
             self.decoder_model_runner.prepare_forward_pass(hat_batch_info)
             model_runner_output = self.decoder_worker.execute_model(scheduler_output)
             scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)

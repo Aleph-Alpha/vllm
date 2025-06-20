@@ -439,10 +439,10 @@ class HATDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         word_positions: Optional[torch.Tensor],
         predictive_word_embeddings: Optional[torch.Tensor],
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
+        cu_seqlens_byte: torch.Tensor,
+        cu_seqlens_word: torch.Tensor,
+        max_seqlen_byte: int,
+        max_seqlen_word: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -457,10 +457,10 @@ class HATDecoderLayer(nn.Module):
             q_input=hidden_states,
             kv_input=word_embeddings,
             kv_position_ids=word_positions,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_byte,
+            cu_seqlens_k=cu_seqlens_word,
+            max_seqlen_q=max_seqlen_byte,
+            max_seqlen_k=max_seqlen_word,
         )
 
         hidden_states, residual = self.llama_layer(positions, hidden_states, residual)
@@ -531,15 +531,6 @@ class HATEncoderConnector(nn.Module):
         cu_seqlens_k = torch.cumsum(word_lens_bytes_flat, dim=0, dtype=torch.int32)
         max_seqlen_k = word_lens_bytes_flat.max()
 
-        # Update latent word embeddings with information from characters
-        # print("Cross attention encoder connector shapes")
-        # print("word_positions", word_positions)
-        # print("word_positions_shape", word_positions.shape)
-        # print("latent word embeddings" ,latent_word_embeddings.shape)
-        # print("encoder hidden states", encoder_hidden_states.shape)
-        # print("byte positions", byte_positions)
-        # print("byte positions_shape", byte_positions.shape)
-        
         updated_latent_word_embeddings = self.cross_attention_encoder_connector(
             q_position_ids=word_positions,
             q_input=latent_word_embeddings,
@@ -550,7 +541,6 @@ class HATEncoderConnector(nn.Module):
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k
         )
-        # print("updated_latent_word_embeddings", torch.any(torch.isnan(updated_latent_word_embeddings)))
         return updated_latent_word_embeddings
 
     def load_weights(self, weights: Iterable[Tuple[str,
@@ -810,8 +800,8 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
         self,
         positions: torch.Tensor,
         previous_hidden_states: Optional[torch.Tensor] = None,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        max_seqlen_q: Optional[torch.Tensor] = None,
+        cu_seqlens_byte: Optional[torch.Tensor] = None,
+        max_seqlen_byte: Optional[torch.Tensor] = None,
         predictive_word_embeddings: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -820,23 +810,18 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
 
         if predictive_word_embeddings is None:
             predictive_word_embeddings = self.pred_word_embeds_buffer[:positions.shape[0], :]
-            cu_seqlens_q = torch.arange(positions.shape[0] + 1, device=positions.device, dtype=torch.int32)
-            max_seqlen_q = 1
+            cu_seqlens_byte = torch.arange(positions.shape[0] + 1, device=positions.device, dtype=torch.int32)
+            max_seqlen_byte = 1
 
         if previous_hidden_states is None:
             previous_hidden_states = self.previous_hidden_states_buffer[:positions.shape[0], :]
 
-        cu_seqlens_k = torch.arange(input_ids.shape[0] + 1, device=input_ids.device, dtype=torch.int32)
-        max_seqlen_k = 1
+        cu_seqlens_word = torch.arange(input_ids.shape[0] + 1, device=input_ids.device, dtype=torch.int32)
+        max_seqlen_word = 1
         input_ids = input_ids.to(torch.int64)
 
-        # print("DECODER ##############################")
-        # print("positions", positions)
-        # print("previous_hidden_states", previous_hidden_states.shape)
-        # print("input_ids", input_ids)
-        # print("predictive_word_embeddings", predictive_word_embeddings.shape)
-        model_output = self.decoder(positions, previous_hidden_states, cu_seqlens_q, cu_seqlens_k,
-                                    max_seqlen_q, max_seqlen_k, input_ids, predictive_word_embeddings)
+        model_output = self.decoder(positions, previous_hidden_states, cu_seqlens_byte, cu_seqlens_word,
+                                    max_seqlen_byte, max_seqlen_word, input_ids, predictive_word_embeddings)
         model_output = self.layer_norm(model_output)
         return model_output
 
