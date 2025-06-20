@@ -253,7 +253,7 @@ class HATWorker(WorkerBase):
         predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_byte_final_decoder, predictive_word_embeddings)
         self.hat_manager.update_backbone_info(scheduler_output_word)
         
-        word_positions_final_decoder, cu_seqlens_q_final_decoder, max_seqlen_q_final_decoder = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
+        word_positions_final_decoder, word_len_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
         
         if self.steps == 5:
             # exit()
@@ -261,10 +261,9 @@ class HATWorker(WorkerBase):
         self.steps += 1
         
         hat_batch_input_final_decoder = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings_final_decoder,
-                                                    word_positions=word_positions_final_decoder,
-                                                    encoder_hidden_states=encoder_hidden_states_final_decoder,
-                                                    cu_seqlen_byte=cu_seqlens_q_final_decoder,
-                                                    max_seqlen_byte=max_seqlen_q_final_decoder)
+                                                      word_positions=word_positions_final_decoder,
+                                                      encoder_hidden_states=encoder_hidden_states_final_decoder,
+                                                      word_len_bytes=word_len_bytes)
         model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_final_decoder, hat_batch_input_final_decoder)
         
         scheduled_cached_reqs_dec_word_boundary = safe_list_slice(scheduler_output_byte_final_decoder.scheduled_cached_reqs,
@@ -309,12 +308,8 @@ class HATWorker(WorkerBase):
         word_positions = self.hat_manager.compute_position_ids_decoder_autoregressive_phase(scheduler_output)
         
         hat_batch_input = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings,
-                                      word_positions=word_positions,
-                                      encoder_hidden_states=encoder_hidden_states,
-                                      cu_seqlen_byte=torch.arange(word_positions.shape[0]+1, 
-                                                                  device=self.device,
-                                                                  dtype=torch.int32),
-                                      max_seqlen_byte=1)
+                                        word_positions=word_positions,
+                                        encoder_hidden_states=encoder_hidden_states)
         model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
         
@@ -326,12 +321,8 @@ class HATWorker(WorkerBase):
             word_positions = self.hat_manager.compute_position_ids_decoder_autoregressive_phase(scheduler_output)
             
             hat_batch_input = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings,
-                                          word_positions=word_positions,
-                                          encoder_hidden_states=encoder_hidden_states,
-                                          cu_seqlen_byte=torch.arange(word_positions.shape[0]+1, 
-                                                                      device=self.device,
-                                                                      dtype=torch.int32),
-                                          max_seqlen_byte=1)
+                                            word_positions=word_positions,
+                                            encoder_hidden_states=encoder_hidden_states)
             model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
             scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
     

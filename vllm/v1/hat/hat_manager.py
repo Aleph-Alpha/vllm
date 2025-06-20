@@ -433,10 +433,7 @@ class HATManager:
                                                 device=self.device)
         word_positions = torch.hstack(word_positions)
         
-        cu_seqlens_q_final_decoder = torch.cumsum(word_lens_bytes_per_task, dim=0, dtype=torch.int32)
-        max_seqlen_q_final_decoder = word_lens_bytes_per_task.max()
-        
-        return word_positions, cu_seqlens_q_final_decoder, max_seqlen_q_final_decoder
+        return word_positions, word_lens_bytes_per_task
     
     def prepare_exec_model_req_for_dec_autoregressive_phase(self, scheduler_output_byte_enc_dec: SchedulerOutput) -> torch.Tensor:
         predictive_word_embeddings = [] 

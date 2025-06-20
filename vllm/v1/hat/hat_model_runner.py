@@ -73,11 +73,15 @@ class HATModelRunner(GPUModelRunner):
     def __init__( self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.role: Optional[HATSubmodelRole] = None
+
+        # Tensors for CUDA Graph Caching, set in load_model
+        
+        self.previous_hidden_states: Optional[torch.Tensor] = None
+        self.predictive_word_embeddings: Optional[torch.Tensor] = None
     
     def load_model(self) -> None:
         super().load_model()
         self._set_role()
-
     
     def register_request(self, new_req_data: NewRequestData) -> None:
         req_id = new_req_data.req_id
@@ -429,8 +433,7 @@ class HATModelRunner(GPUModelRunner):
                         "input_ids": hat_batch_input.word_positions,
                         "inputs_embeds": None,
                         "positions": positions,
-                        "cu_seqlens_byte": hat_batch_input.cu_seqlen_byte,
-                        "max_seqlen_byte": hat_batch_input.max_seqlen_byte,
+                        "word_len_bytes": hat_batch_input.word_len_bytes,
                         "predictive_word_embeddings": hat_batch_input.predictive_word_embeddings,
                         "previous_hidden_states": hat_batch_input.encoder_hidden_states,
                         "intermediate_tensors": None,

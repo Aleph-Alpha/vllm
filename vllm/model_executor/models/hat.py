@@ -800,18 +800,22 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
         self,
         positions: torch.Tensor,
         previous_hidden_states: Optional[torch.Tensor] = None,
-        cu_seqlens_byte: Optional[torch.Tensor] = None,
-        max_seqlen_byte: Optional[torch.Tensor] = None,
+        word_len_bytes: Optional[torch.Tensor] = None,
         predictive_word_embeddings: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
 
-        if predictive_word_embeddings is None:
-            predictive_word_embeddings = self.pred_word_embeds_buffer[:positions.shape[0], :]
+        if word_len_bytes is None:
             cu_seqlens_byte = torch.arange(positions.shape[0] + 1, device=positions.device, dtype=torch.int32)
             max_seqlen_byte = 1
+        else:
+            cu_seqlens_byte = torch.cumsum(word_len_bytes, dim=0, dtype=torch.int32)
+            max_seqlen_byte = word_len_bytes.max()
+
+        if predictive_word_embeddings is None:
+            predictive_word_embeddings = self.pred_word_embeds_buffer[:positions.shape[0], :]
 
         if previous_hidden_states is None:
             previous_hidden_states = self.previous_hidden_states_buffer[:positions.shape[0], :]
