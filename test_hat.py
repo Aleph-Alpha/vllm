@@ -158,15 +158,15 @@ if __name__ == "__main__":
     #llm = LLM(model="/Models/hat_dpo",
           trust_remote_code=True,
           dtype=torch.bfloat16,
-          enforce_eager=True,
+          enforce_eager=False,
           tensor_parallel_size=1,
           gpu_memory_utilization=0.9,
           block_size=256,
           disable_cascade_attn=True,
-          max_num_batched_tokens=100,
+          max_num_batched_tokens=1000,
           max_model_len=20000, # Can be set to 100k on A100
           max_num_seqs=8)
-    outputs = llm.generate([format_llama(p) for p in prompts_8], sampling_params)
+    outputs = llm.generate([format_llama(p) for p in prompts_1], sampling_params)
     #outputs = llm.generate([p for p in prompts_1], sampling_params)
 
     for output in outputs:

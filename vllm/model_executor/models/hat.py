@@ -10,6 +10,7 @@ from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -27,12 +28,72 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils import direct_register_custom_op
 
 from .interfaces import SupportsLoRA
 from .utils import (AutoWeightsLoader,
                     is_pp_missing_parameter,
                     maybe_prefix)
+
+
+def run_cross_attn(q: torch.Tensor,
+                   k: torch.Tensor,
+                   v: torch.Tensor,
+                   cu_seqlens_q: torch.Tensor,
+                   cu_seqlens_k: torch.Tensor,
+                   max_seqlen_q: int,
+                   max_seqlen_k: int,
+                   num_heads: int,
+                   head_dim: int,
+                   num_kv_heads: int,
+                   force_attn: bool = False) -> torch.Tensor:
+    #if not force_attn:
+    #    attn_metadata = get_forward_context().attn_metadata
+    #    if attn_metadata is None:
+    #        return torch.empty_like(q).contiguous()
+
+    shape = q.shape
+    q = q.reshape(-1, num_heads, head_dim)
+    k = k.reshape(-1, num_kv_heads, head_dim)
+    v = v.reshape(-1, num_kv_heads, head_dim)
+
+    output = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        fa_version=2,
+        causal=False,
+    )
+    return output.reshape(shape).contiguous()
+
+
+def run_cross_attn_fake(q: torch.Tensor,
+                        k: torch.Tensor,
+                        v: torch.Tensor,
+                        cu_seqlens_q: torch.Tensor,
+                        cu_seqlens_k: torch.Tensor,
+                        max_seqlen_q: int,
+                        max_seqlen_k: int,
+                        num_heads: int,
+                        head_dim: int,
+                        num_kv_heads: int,
+                        force_attn: bool = False) -> torch.Tensor:
+    return torch.empty_like(q).contiguous()
+    
+
+direct_register_custom_op(
+    op_name="run_cross_attn",
+    op_func=run_cross_attn,
+    mutates_args=[],
+    fake_impl=run_cross_attn_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
 
 
 class HATAttention(nn.Module):
@@ -230,6 +291,7 @@ class HATCrossAttention(nn.Module):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        force_attn: bool = False,
     ) -> torch.Tensor:
         q, _ = self.q_proj(q_input)
         kv, _ = self.kv_proj(kv_input)
@@ -239,22 +301,8 @@ class HATCrossAttention(nn.Module):
         q, _ = self.rotary_emb(q_position_ids, q, torch.zeros_like(q))
         _, k = self.rotary_emb(kv_position_ids, torch.zeros_like(k), k)
 
-        shape = q.shape
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-
-        output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            causal=False,
-        )
-        output, _ = self.o_proj(output.reshape(shape).contiguous())
+        output = torch.ops.vllm.run_cross_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, self.num_heads, self.head_dim, self.num_kv_heads, force_attn)
+        output, _ = self.o_proj(output)
 
         return output
     
@@ -539,7 +587,8 @@ class HATEncoderConnector(nn.Module):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=1,
-            max_seqlen_k=max_seqlen_k
+            max_seqlen_k=max_seqlen_k,
+            force_attn=True,
         )
         return updated_latent_word_embeddings
 
@@ -775,12 +824,6 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
 
-        buffer_pred_word_embeds = torch.zeros(256, config.cross_attention_config.hidden_size_kv)
-        self.register_buffer('pred_word_embeds_buffer', buffer_pred_word_embeds)
-
-        buffer_previous_hidden_states = torch.zeros(256, config.hidden_size)
-        self.register_buffer('previous_hidden_states_buffer', buffer_previous_hidden_states)
-
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size,
@@ -814,15 +857,8 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
             cu_seqlens_byte = torch.cumsum(word_len_bytes, dim=0, dtype=torch.int32)
             max_seqlen_byte = word_len_bytes.max()
 
-        if predictive_word_embeddings is None:
-            predictive_word_embeddings = self.pred_word_embeds_buffer[:positions.shape[0], :]
-
-        if previous_hidden_states is None:
-            previous_hidden_states = self.previous_hidden_states_buffer[:positions.shape[0], :]
-
         cu_seqlens_word = torch.arange(input_ids.shape[0] + 1, device=input_ids.device, dtype=torch.int32)
         max_seqlen_word = 1
-        input_ids = input_ids.to(torch.int64)
 
         model_output = self.decoder(positions, previous_hidden_states, cu_seqlens_byte, cu_seqlens_word,
                                     max_seqlen_byte, max_seqlen_word, input_ids, predictive_word_embeddings)
@@ -930,9 +966,6 @@ class HATBackboneForCausalLM(nn.Module, SupportsLoRA):
         first_word_embedding = torch.nn.Parameter(torch.empty(1, 1, config.hidden_size)) 
         self.decoder_connector.register_parameter("first_word_embedding", first_word_embedding)
 
-        buffer = torch.zeros(256, config.hidden_size)
-        self.register_buffer('previous_hidden_states_buffer', buffer)
-
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
@@ -949,10 +982,6 @@ class HATBackboneForCausalLM(nn.Module, SupportsLoRA):
         input_ids: Optional[torch.Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         ) -> torch.Tensor:
-
-        if previous_hidden_states is None:
-            previous_hidden_states = self.previous_hidden_states_buffer[:positions.shape[0], :]
-
         model_output = self.backbone(positions, previous_hidden_states)
         return model_output
 

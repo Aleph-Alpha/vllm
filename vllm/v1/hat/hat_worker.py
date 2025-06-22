@@ -255,9 +255,9 @@ class HATWorker(WorkerBase):
         
         word_positions_final_decoder, word_len_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
         
-        if self.steps == 5:
-            # exit()
-            pass
+        if self.steps == 2:
+            exit()
+            #pass
         self.steps += 1
         
         hat_batch_input_final_decoder = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings_final_decoder,
@@ -337,8 +337,6 @@ class HATWorker(WorkerBase):
         self.hat_manager.first_word_embedding = (
             self.backbone_worker.get_model().decoder_connector.first_word_embedding.squeeze(0)
         )
-        if self.use_cuda_graph:
-            self.pred_word_embeds_buffer = self.decoder_worker.get_model().pred_word_embeds_buffer
 
     @property
     def rank(self):

@@ -182,7 +182,7 @@ class HATManager:
         # Necessary for final decoder forward pass
         
         encoder_hidden_states_final_decoder = safe_tensor_slice(encoder_hidden_states,
-                                                                      self.num_decodes_not_word_boundary)
+                                                                      self.num_decodes_not_word_boundary).clone()
         
         num_decodes = self.num_decodes_not_word_boundary + self.num_decodes_word_boundary
         encoder_hidden_states_decodes = safe_tensor_slice(encoder_hidden_states,
@@ -283,7 +283,7 @@ class HATManager:
                 offset_beginning += 1                
         
         if len(encoder_hidden_states_enc_dec_loop) > 0:
-            encoder_hidden_states_enc_dec_loop = torch.cat(encoder_hidden_states_enc_dec_loop, dim=0)
+            encoder_hidden_states_enc_dec_loop = torch.cat(encoder_hidden_states_enc_dec_loop, dim=0).clone()
         else:
             encoder_hidden_states_enc_dec_loop = None
 
@@ -491,6 +491,7 @@ class HATManager:
                 req_state.is_partial_prefill = False
                 req_state.is_prefill = False
 
+            print(new_token_id)
             req_state.byte_position += req_state.num_scheduled_tokens_byte
             req_state.word_position += req_state.num_scheduled_tokens_backbone
             req_state.word_position_cpu += req_state.num_scheduled_tokens_backbone

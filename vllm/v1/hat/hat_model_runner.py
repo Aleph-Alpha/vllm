@@ -78,11 +78,32 @@ class HATModelRunner(GPUModelRunner):
         
         self.previous_hidden_states: Optional[torch.Tensor] = None
         self.predictive_word_embeddings: Optional[torch.Tensor] = None
+        self.decoder_word_positions: Optional[torch.Tensor] = None
     
     def load_model(self) -> None:
         super().load_model()
         self._set_role()
-    
+
+        match self.role:
+            case HATSubmodelRole.DECODER:
+                self.previous_hidden_states = torch.zeros(self.max_num_tokens,
+                    self.model_config.hf_config.hidden_size,
+                    dtype=self.dtype,
+                    device=self.device)
+                self.predictive_word_embeddings = torch.zeros(self.max_num_tokens,
+                    self.model_config.hf_config.cross_attention_config.hidden_size_kv,
+                    dtype=self.dtype,
+                    device=self.device)
+                self.decoder_word_positions = torch.zeros(
+                    self.max_num_tokens,
+                    dtype=torch.int64,
+                    device=self.device)
+            case HATSubmodelRole.BACKBONE:
+                self.previous_hidden_states = torch.zeros(self.max_num_tokens,
+                    self.model_config.hf_config.hidden_size,
+                    dtype=self.dtype,
+                    device=self.device)
+
     def register_request(self, new_req_data: NewRequestData) -> None:
         req_id = new_req_data.req_id
         sampling_params = new_req_data.sampling_params
@@ -249,11 +270,15 @@ class HATModelRunner(GPUModelRunner):
         # Prepare the decoder inputs.
         attn_metadata, logits_indices, _ = (
             self._prepare_inputs(scheduler_output))
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        if (self.use_cuda_graph
-                and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
+        decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or (num_scheduled_tokens == hat_batch_input.word_positions.shape[0])
+        use_cuda_graph = self.use_cuda_graph and decoder_cuda_graph and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
+
+        if use_cuda_graph:
             # Use piecewise CUDA graphs.
             # Add padding to the batch size.
+            self._copy_cuda_graph_inputs(hat_batch_input, num_scheduled_tokens)
             num_input_tokens = self.vllm_config.pad_for_cudagraph(
                 num_scheduled_tokens)
         else:
@@ -281,7 +306,7 @@ class HATModelRunner(GPUModelRunner):
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
 
-        model_kwargs = self._get_model_kwargs(input_ids, positions, num_scheduled_tokens, hat_batch_input)
+        model_kwargs = self._get_model_kwargs(input_ids, positions, num_input_tokens, hat_batch_input, use_cuda_graph)
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
@@ -315,7 +340,7 @@ class HATModelRunner(GPUModelRunner):
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
         else:
-            return hidden_states
+            return hidden_states[:num_scheduled_tokens, :]
         
         if broadcast_pp_output:
             model_output_broadcast_data = {
@@ -396,48 +421,175 @@ class HATModelRunner(GPUModelRunner):
             finished_recving=finished_recving,
         )
         
+    def _copy_cuda_graph_inputs(self, hat_batch_input: HATBatchInput, num_scheduled_tokens: int) -> None:
+        match self.role:
+            case HATSubmodelRole.DECODER:
+                self.previous_hidden_states[:num_scheduled_tokens, :].copy_(hat_batch_input.encoder_hidden_states, non_blocking=True)
+                self.predictive_word_embeddings[:num_scheduled_tokens, :].copy_(hat_batch_input.predictive_word_embeddings, non_blocking=True)
+                self.decoder_word_positions[:num_scheduled_tokens].copy_(hat_batch_input.word_positions, non_blocking=True)
+            case HATSubmodelRole.BACKBONE:
+                self.previous_hidden_states[:num_scheduled_tokens, :].copy_(hat_batch_input.latent_word_embeddings, non_blocking=True)
+            case HATSubmodelRole.ENCODER:
+                pass
+
+    @torch.inference_mode()
+    def _dummy_run(
+        self,
+        num_tokens: int,
+        skip_attn: bool = True,
+    ) -> torch.Tensor:
+
+        # Padding for DP
+        num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+        num_tokens += num_pad
+
+        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+        # for dummy run with LoRA so that the num_reqs collectively
+        # has num_tokens in total.
+        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert len(num_scheduled_tokens_list) == num_reqs
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list,
+                                        dtype=np.int32)
+
+        if skip_attn:
+            attn_metadata: Optional[dict[str, Any]] = None
+        else:
+            query_start_loc = self.query_start_loc[:num_reqs + 1]
+            # Make sure max_model_len is used at the graph capture time.
+            self.seq_lens_np[:num_reqs] = self.max_model_len
+            self.seq_lens_np[num_reqs:] = 0
+            self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+                                           non_blocking=True)
+            seq_lens = self.seq_lens[:num_reqs]
+
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc, seq_lens=seq_lens)
+
+            attn_metadata = {}
+            for kv_cache_group_id, kv_cache_group_spec in enumerate(
+                    self.kv_cache_config.kv_cache_groups):
+                attn_metadata_i = (
+                    self.attn_metadata_builders[kv_cache_group_id].build(
+                        num_reqs=num_reqs,
+                        num_actual_tokens=num_tokens,
+                        max_query_len=num_tokens,
+                        common_prefix_len=0,
+                        common_attn_metadata=common_attn_metadata,
+                    ))
+                for layer_name in kv_cache_group_spec.layer_names:
+                    attn_metadata[layer_name] = attn_metadata_i
+
+        with self.maybe_dummy_run_with_lora(self.lora_config,
+                                            num_scheduled_tokens):
+            model = self.model
+            model_kwargs = self._get_dummy_model_kwargs(num_tokens)
+
+            if get_pp_group().is_first_rank:
+                intermediate_tensors = None
+            else:
+                if self.intermediate_tensors is None:
+                    self.intermediate_tensors = (
+                        self.model.make_empty_intermediate_tensors(
+                            batch_size=self.max_num_tokens,
+                            dtype=self.model_config.dtype,
+                            device=self.device))
+
+                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                    num_tokens, None, False)
+
+            with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp):
+                outputs = model(
+                    **model_kwargs,
+                    intermediate_tensors=intermediate_tensors,
+                )
+
+        logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        return outputs[logit_indices]
+
+    def _get_dummy_model_kwargs(self, num_input_tokens: int) -> dict[str, Any]:
+        match self.role:
+            case HATSubmodelRole.ENCODER:
+                model_kwargs = {
+                    "input_ids": self.input_ids[:num_input_tokens],
+                    "inputs_embeds": None,
+                    "positions": self.positions[:num_input_tokens],
+                }
+            case HATSubmodelRole.BACKBONE:
+                model_kwargs = {
+                    "input_ids": None,
+                    "inputs_embeds": None,
+                    "positions": self.positions[:num_input_tokens],
+                    "previous_hidden_states": self.previous_hidden_states[:num_input_tokens, :],
+                }
+            case HATSubmodelRole.DECODER:
+                model_kwargs = {
+                    # Reuse input_ids for word positions, because the decoder does not need input_ids
+                    "input_ids": self.decoder_word_positions[:num_input_tokens],
+                    "inputs_embeds": None,
+                    "positions": self.positions[:num_input_tokens],
+                    "word_len_bytes": None,
+                    "predictive_word_embeddings": self.predictive_word_embeddings[:num_input_tokens, :],
+                    "previous_hidden_states": self.previous_hidden_states[:num_input_tokens, :],
+                }
+        return model_kwargs
+
     def _get_model_kwargs(self, input_ids: torch.Tensor,
                           positions: torch.Tensor,
-                          num_scheduled_tokens: int,
-                          hat_batch_input: Optional[HATBatchInput] = None) -> dict[str, Any]:
+                          num_input_tokens: int,
+                          hat_batch_input: Optional[HATBatchInput] = None,
+                          use_cuda_graph: bool = False) -> dict[str, Any]:
         match self.role:
             case HATSubmodelRole.ENCODER:
                 model_kwargs = {
                     "input_ids": input_ids,
                     "inputs_embeds": None,
                     "positions": positions,
-                    "intermediate_tensors": None,
                 }
             case HATSubmodelRole.BACKBONE:
+                previous_hidden_states = hat_batch_input.latent_word_embeddings
+                if use_cuda_graph:
+                    previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
                 model_kwargs = {
                     "input_ids": None,
                     "inputs_embeds": None,
                     "positions": positions,
-                    "previous_hidden_states": hat_batch_input.latent_word_embeddings,
-                    "intermediate_tensors": None,
+                    "previous_hidden_states": previous_hidden_states,
                 }
             case HATSubmodelRole.DECODER:
-                if (self.use_cuda_graph
-                        and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
-                    model_kwargs = {
-                        # Reuse input_ids for word positions, because the decoder does not need input_ids
-                        "input_ids": hat_batch_input.word_positions,
-                        "inputs_embeds": None,
-                        "positions": positions,
-                        "previous_hidden_states": hat_batch_input.encoder_hidden_states,
-                        "intermediate_tensors": None,
-                    }
-                else:
-                    model_kwargs = {
-                        # Reuse input_ids for word positions, because the decoder does not need input_ids
-                        "input_ids": hat_batch_input.word_positions,
-                        "inputs_embeds": None,
-                        "positions": positions,
-                        "word_len_bytes": hat_batch_input.word_len_bytes,
-                        "predictive_word_embeddings": hat_batch_input.predictive_word_embeddings,
-                        "previous_hidden_states": hat_batch_input.encoder_hidden_states,
-                        "intermediate_tensors": None,
-                    }
+                previous_hidden_states = hat_batch_input.encoder_hidden_states
+                predictive_word_embeddings = hat_batch_input.predictive_word_embeddings
+                word_positions = hat_batch_input.word_positions
+                word_len_bytes = hat_batch_input.word_len_bytes
+                if use_cuda_graph:
+                    previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
+                    predictive_word_embeddings = self.predictive_word_embeddings[:num_input_tokens, :]
+                    word_positions = self.decoder_word_positions[:num_input_tokens]
+                    word_len_bytes = None
+
+                print(word_positions)
+                print(positions)
+                print(word_len_bytes)
+                print(predictive_word_embeddings)
+                print(previous_hidden_states)
+                model_kwargs = {
+                    # Reuse input_ids for word positions, because the decoder does not need input_ids
+                    "input_ids": word_positions,
+                    "inputs_embeds": None,
+                    "positions": positions,
+                    "word_len_bytes": word_len_bytes,
+                    "predictive_word_embeddings": predictive_word_embeddings,
+                    "previous_hidden_states": previous_hidden_states,
+                }
         return model_kwargs
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
