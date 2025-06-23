@@ -108,7 +108,7 @@ class HATWorker(WorkerBase):
     
     def determine_available_memory(self) -> int:
         # TODO
-        return int(10e9)
+        return int(40e9)
     
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
@@ -242,6 +242,8 @@ class HATWorker(WorkerBase):
                 self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
             )
 
+
+            #scheduler_metadata = torch.zeros(word_positions.shape[0], dtype=torch.int32, device=self.device)
             updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
                                                                     byte_positions,
                                                                     word_positions,

@@ -79,6 +79,10 @@ class HATModelRunner(GPUModelRunner):
         self.previous_hidden_states: Optional[torch.Tensor] = None
         self.predictive_word_embeddings: Optional[torch.Tensor] = None
         self.decoder_word_positions: Optional[torch.Tensor] = None
+
+        self.scheduler_metadata = torch.zeros(self.max_num_reqs + 1,
+                                              dtype=torch.int32,
+                                              device=self.device)
     
     def load_model(self) -> None:
         super().load_model()
@@ -267,6 +271,9 @@ class HATModelRunner(GPUModelRunner):
 
             return self.kv_connector_no_forward(scheduler_output)
 
+        attn_metadata, logits_indices, _ = (
+            self._prepare_inputs(scheduler_output))
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or (num_scheduled_tokens == hat_batch_input.word_positions.shape[0])
         use_cuda_graph = self.use_cuda_graph and decoder_cuda_graph and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
@@ -294,8 +301,6 @@ class HATModelRunner(GPUModelRunner):
         num_input_tokens += num_pad
 
         # Prepare the decoder inputs.
-        attn_metadata, logits_indices, _ = (
-            self._prepare_inputs(scheduler_output))
 
         input_ids = self.input_ids[:num_input_tokens]
         positions = self.positions[:num_input_tokens]

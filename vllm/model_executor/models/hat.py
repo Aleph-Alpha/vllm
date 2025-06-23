@@ -2,7 +2,7 @@ from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from vllm.vllm_flash_attn import flash_attn_varlen_func
+from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
 
 from transformers import PretrainedConfig
 
@@ -46,11 +46,15 @@ def run_cross_attn(q: torch.Tensor,
                    max_seqlen_q: int,
                    max_seqlen_k: int,
                    output: torch.Tensor,
-                   force_attn: bool = False) -> None:
+                   force_attn: bool = False,
+                   scheduler_metadata: Optional[torch.Tensor] = None) -> None:
     #if not force_attn:
     #    attn_metadata = get_forward_context().attn_metadata
     #    if attn_metadata is None:
     #        return torch.empty_like(q).contiguous()
+    print(q.shape)
+    print(k.shape)
+    print(v.shape)
     flash_attn_varlen_func(
         q=q,
         k=k,
@@ -60,6 +64,8 @@ def run_cross_attn(q: torch.Tensor,
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        fa_version=3,
+        scheduler_metadata=scheduler_metadata,
         causal=False,
     )
 
@@ -72,7 +78,8 @@ def run_cross_attn_fake(q: torch.Tensor,
                         max_seqlen_q: int,
                         max_seqlen_k: int,
                         output: torch.Tensor,
-                        force_attn: bool = False) -> None:
+                        force_attn: bool = False,
+                        scheduler_metadata: Optional[torch.Tensor] = None) -> None:
     return
     
 
@@ -281,6 +288,7 @@ class HATCrossAttention(nn.Module):
         max_seqlen_q: int,
         max_seqlen_k: int,
         force_attn: bool = False,
+        scheduler_metadata: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.q_proj(q_input)
         kv, _ = self.kv_proj(kv_input)
@@ -296,7 +304,7 @@ class HATCrossAttention(nn.Module):
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         output = torch.empty(shape, dtype=q.dtype, device=q.device)
         output = output.view(-1, self.num_heads, self.head_dim)
-        torch.ops.vllm.run_cross_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, output, force_attn)
+        torch.ops.vllm.run_cross_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, output, force_attn, scheduler_metadata)
         output, _ = self.o_proj(output.view(-1, self.hidden_size))
 
         return output
@@ -426,6 +434,7 @@ class HATDecoderLayer(nn.Module):
         layer_type: type[nn.Module] = HATTransformerLayer,
     ) -> None:
         super().__init__()
+        self.config = vllm_config.model_config.hf_config
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
@@ -495,6 +504,25 @@ class HATDecoderLayer(nn.Module):
                 hidden_states, residual)
         word_embeddings = self.kv_norm(predictive_word_embeddings)
 
+        print(positions.shape)
+        print(max_seqlen_byte)
+        print(max_seqlen_word)
+        print(cu_seqlens_byte)
+        scheduler_metadata = get_scheduler_metadata(
+                batch_size=hidden_states.shape[0],
+                max_seqlen_q=max_seqlen_byte,
+                max_seqlen_k=max_seqlen_word,
+                cache_seqlens=torch.zeros(0, device=word_positions.device, dtype=torch.int32),
+                num_heads_q=self.config.cross_attention_config.num_attention_heads,
+                num_heads_kv=getattr(self.config.cross_attention_config, "attention_num_kv_heads",
+                                    self.config.cross_attention_config.num_attention_heads),
+                headdim=self.config.head_dim,
+                page_size=256,
+                cu_seqlens_q=cu_seqlens_byte,
+                causal=False,
+            )
+        print(scheduler_metadata.shape)
+
         hidden_states = self.cross_attention(
             q_position_ids=positions,
             q_input=hidden_states,
@@ -504,6 +532,7 @@ class HATDecoderLayer(nn.Module):
             cu_seqlens_k=cu_seqlens_word,
             max_seqlen_q=max_seqlen_byte,
             max_seqlen_k=max_seqlen_word,
+            scheduler_metadata=scheduler_metadata,
         )
 
         hidden_states, residual = self.llama_layer(positions, hidden_states, residual)
@@ -520,6 +549,7 @@ class HATEncoderConnector(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.cross_attention_config.hidden_size
         self.quant_config = quant_config
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -574,6 +604,20 @@ class HATEncoderConnector(nn.Module):
         cu_seqlens_k = torch.cumsum(word_lens_bytes_flat, dim=0, dtype=torch.int32)
         max_seqlen_k = word_lens_bytes_flat.max()
 
+        scheduler_metadata = get_scheduler_metadata(
+                batch_size=word_positions.shape[0],
+                max_seqlen_q=1,
+                max_seqlen_k=max_seqlen_k,
+                cache_seqlens=torch.zeros(0, device=word_positions.device, dtype=torch.int32),
+                num_heads_q=self.config.cross_attention_config.num_attention_heads,
+                num_heads_kv=getattr(self.config.cross_attention_config, "attention_num_kv_heads",
+                                    self.config.cross_attention_config.num_attention_heads),
+                headdim=self.config.head_dim,
+                page_size=256,
+                cu_seqlens_q=cu_seqlens_q,
+                causal=False,
+            )
+
         updated_latent_word_embeddings = self.cross_attention_encoder_connector(
             q_position_ids=word_positions,
             q_input=latent_word_embeddings,
@@ -584,6 +628,7 @@ class HATEncoderConnector(nn.Module):
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
             force_attn=True,
+            scheduler_metadata=scheduler_metadata,
         )
         return updated_latent_word_embeddings
 
