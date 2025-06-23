@@ -145,7 +145,7 @@ prompts_1 = [prompts_128[1]]
 prompts_1 = ["The big horoscope"]
 # prompts_1 = ["Hel"]
 
-max_tokens = 200
+max_tokens = 1000
 sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
 
 format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -164,8 +164,8 @@ if __name__ == "__main__":
           block_size=256,
           disable_cascade_attn=True,
           max_num_batched_tokens=1000,
-          max_model_len=20000, # Can be set to 100k on A100
-          max_num_seqs=8)
+          max_model_len=1000, # Can be set to 100k on A100
+          max_num_seqs=1)
     outputs = llm.generate([format_llama(p) for p in prompts_1], sampling_params)
     #outputs = llm.generate([p for p in prompts_1], sampling_params)
 

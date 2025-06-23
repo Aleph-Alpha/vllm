@@ -256,8 +256,8 @@ class HATWorker(WorkerBase):
         word_positions_final_decoder, word_len_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
         
         if self.steps == 2:
-            exit()
-            #pass
+            #exit()
+            pass
         self.steps += 1
         
         hat_batch_input_final_decoder = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings_final_decoder,

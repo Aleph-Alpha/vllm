@@ -267,10 +267,6 @@ class HATModelRunner(GPUModelRunner):
 
             return self.kv_connector_no_forward(scheduler_output)
 
-        # Prepare the decoder inputs.
-        attn_metadata, logits_indices, _ = (
-            self._prepare_inputs(scheduler_output))
-
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or (num_scheduled_tokens == hat_batch_input.word_positions.shape[0])
         use_cuda_graph = self.use_cuda_graph and decoder_cuda_graph and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
@@ -296,6 +292,10 @@ class HATModelRunner(GPUModelRunner):
         # Padding for DP
         num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
         num_input_tokens += num_pad
+
+        # Prepare the decoder inputs.
+        attn_metadata, logits_indices, _ = (
+            self._prepare_inputs(scheduler_output))
 
         input_ids = self.input_ids[:num_input_tokens]
         positions = self.positions[:num_input_tokens]
@@ -576,11 +576,6 @@ class HATModelRunner(GPUModelRunner):
                     word_positions = self.decoder_word_positions[:num_input_tokens]
                     word_len_bytes = None
 
-                print(word_positions)
-                print(positions)
-                print(word_len_bytes)
-                print(predictive_word_embeddings)
-                print(previous_hidden_states)
                 model_kwargs = {
                     # Reuse input_ids for word positions, because the decoder does not need input_ids
                     "input_ids": word_positions,

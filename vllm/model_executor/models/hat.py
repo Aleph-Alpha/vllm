@@ -45,32 +45,23 @@ def run_cross_attn(q: torch.Tensor,
                    cu_seqlens_k: torch.Tensor,
                    max_seqlen_q: int,
                    max_seqlen_k: int,
-                   num_heads: int,
-                   head_dim: int,
-                   num_kv_heads: int,
-                   force_attn: bool = False) -> torch.Tensor:
+                   output: torch.Tensor,
+                   force_attn: bool = False) -> None:
     #if not force_attn:
     #    attn_metadata = get_forward_context().attn_metadata
     #    if attn_metadata is None:
     #        return torch.empty_like(q).contiguous()
-
-    shape = q.shape
-    q = q.reshape(-1, num_heads, head_dim)
-    k = k.reshape(-1, num_kv_heads, head_dim)
-    v = v.reshape(-1, num_kv_heads, head_dim)
-
-    output = flash_attn_varlen_func(
-        q,
-        k,
-        v,
+    flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        out=output,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        fa_version=2,
         causal=False,
     )
-    return output.reshape(shape).contiguous()
 
 
 def run_cross_attn_fake(q: torch.Tensor,
@@ -80,17 +71,15 @@ def run_cross_attn_fake(q: torch.Tensor,
                         cu_seqlens_k: torch.Tensor,
                         max_seqlen_q: int,
                         max_seqlen_k: int,
-                        num_heads: int,
-                        head_dim: int,
-                        num_kv_heads: int,
-                        force_attn: bool = False) -> torch.Tensor:
-    return torch.empty_like(q).contiguous()
+                        output: torch.Tensor,
+                        force_attn: bool = False) -> None:
+    return
     
 
 direct_register_custom_op(
     op_name="run_cross_attn",
     op_func=run_cross_attn,
-    mutates_args=[],
+    mutates_args=["output"],
     fake_impl=run_cross_attn_fake,
     dispatch_key=current_platform.dispatch_key,
 )
@@ -301,8 +290,14 @@ class HATCrossAttention(nn.Module):
         q, _ = self.rotary_emb(q_position_ids, q, torch.zeros_like(q))
         _, k = self.rotary_emb(kv_position_ids, torch.zeros_like(k), k)
 
-        output = torch.ops.vllm.run_cross_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, self.num_heads, self.head_dim, self.num_kv_heads, force_attn)
-        output, _ = self.o_proj(output)
+        shape = q.shape
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        output = torch.empty(shape, dtype=q.dtype, device=q.device)
+        output = output.view(-1, self.num_heads, self.head_dim)
+        torch.ops.vllm.run_cross_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, output, force_attn)
+        output, _ = self.o_proj(output.view(-1, self.hidden_size))
 
         return output
     
