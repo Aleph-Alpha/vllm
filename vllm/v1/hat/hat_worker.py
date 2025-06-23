@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 import torch
+import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
@@ -89,6 +90,21 @@ class HATWorker(WorkerBase):
         self.text = "🚀🎉🔥⭐".encode("utf-8")
         self.idx = 0
         self.steps = 0
+
+        if envs.VLLM_TORCH_PROFILER_DIR:
+            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+            logger.info("Profiling enabled. Traces will be saved to: %s",
+                        torch_profiler_trace_dir)
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    torch_profiler_trace_dir, use_gzip=False))
+        else:
+            self.profiler = None
         
     def init_device(self) -> None:
         self.encoder_worker.init_device()
@@ -351,6 +367,16 @@ class HATWorker(WorkerBase):
     @property
     def driver_rank(self) -> int:
         return 0
+
+    def profile(self, is_start: bool = True):
+        if self.profiler is None:
+            raise RuntimeError("Profiler is not enabled.")
+        if is_start:
+            self.profiler.start()
+        else:
+            self.profiler.stop()
+            print(self.profiler.key_averages().table(
+                sort_by="self_cuda_time_total"))
 
 
 class HATModelWorker(Worker):

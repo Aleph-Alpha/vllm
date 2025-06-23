@@ -429,8 +429,8 @@ class HATManager:
             word_lens_bytes_per_task.append(req_state.word_lens_bytes)
             
         word_lens_bytes_per_task = torch.tensor(list(itertools.chain.from_iterable(word_lens_bytes_per_task)),
-                                                dtype=torch.int32,
-                                                device=self.device)
+                                                dtype=torch.int32).pin_memory()
+        word_lens_bytes_per_task = word_lens_bytes_per_task.to(self.device, non_blocking=True)
         word_positions = torch.hstack(word_positions)
         
         return word_positions, word_lens_bytes_per_task
