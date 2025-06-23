@@ -52,9 +52,7 @@ def run_cross_attn(q: torch.Tensor,
     #    attn_metadata = get_forward_context().attn_metadata
     #    if attn_metadata is None:
     #        return torch.empty_like(q).contiguous()
-    print(q.shape)
-    print(k.shape)
-    print(v.shape)
+
     flash_attn_varlen_func(
         q=q,
         k=k,
@@ -64,7 +62,7 @@ def run_cross_attn(q: torch.Tensor,
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        fa_version=3,
+        fa_version=2,
         scheduler_metadata=scheduler_metadata,
         causal=False,
     )
@@ -504,24 +502,22 @@ class HATDecoderLayer(nn.Module):
                 hidden_states, residual)
         word_embeddings = self.kv_norm(predictive_word_embeddings)
 
-        print(positions.shape)
-        print(max_seqlen_byte)
-        print(max_seqlen_word)
-        print(cu_seqlens_byte)
-        scheduler_metadata = get_scheduler_metadata(
-                batch_size=hidden_states.shape[0],
-                max_seqlen_q=max_seqlen_byte,
-                max_seqlen_k=max_seqlen_word,
-                cache_seqlens=torch.zeros(0, device=word_positions.device, dtype=torch.int32),
-                num_heads_q=self.config.cross_attention_config.num_attention_heads,
-                num_heads_kv=getattr(self.config.cross_attention_config, "attention_num_kv_heads",
-                                    self.config.cross_attention_config.num_attention_heads),
-                headdim=self.config.head_dim,
-                page_size=256,
-                cu_seqlens_q=cu_seqlens_byte,
-                causal=False,
-            )
-        print(scheduler_metadata.shape)
+        #if positions.shape[0] == word_positions.shape[0]:
+        #scheduler_metadata = get_scheduler_metadata(
+        #        batch_size=hidden_states.shape[0],
+        #        max_seqlen_q=max_seqlen_byte,
+        #        max_seqlen_k=max_seqlen_word,
+        #        cache_seqlens=torch.zeros(0, device=word_positions.device, dtype=torch.int32),
+        #        num_heads_q=self.config.cross_attention_config.num_attention_heads,
+        #        num_heads_kv=getattr(self.config.cross_attention_config, "attention_num_kv_heads",
+        #                            self.config.cross_attention_config.num_attention_heads),
+        #        headdim=self.config.head_dim,
+        #        page_size=256,
+        #        cu_seqlens_q=cu_seqlens_byte,
+        #        causal=False,
+        #    )
+        #else:
+        #    scheduler_metadata = None
 
         hidden_states = self.cross_attention(
             q_position_ids=positions,
@@ -532,7 +528,7 @@ class HATDecoderLayer(nn.Module):
             cu_seqlens_k=cu_seqlens_word,
             max_seqlen_q=max_seqlen_byte,
             max_seqlen_k=max_seqlen_word,
-            scheduler_metadata=scheduler_metadata,
+            scheduler_metadata=None,
         )
 
         hidden_states, residual = self.llama_layer(positions, hidden_states, residual)
@@ -604,19 +600,19 @@ class HATEncoderConnector(nn.Module):
         cu_seqlens_k = torch.cumsum(word_lens_bytes_flat, dim=0, dtype=torch.int32)
         max_seqlen_k = word_lens_bytes_flat.max()
 
-        scheduler_metadata = get_scheduler_metadata(
-                batch_size=word_positions.shape[0],
-                max_seqlen_q=1,
-                max_seqlen_k=max_seqlen_k,
-                cache_seqlens=torch.zeros(0, device=word_positions.device, dtype=torch.int32),
-                num_heads_q=self.config.cross_attention_config.num_attention_heads,
-                num_heads_kv=getattr(self.config.cross_attention_config, "attention_num_kv_heads",
-                                    self.config.cross_attention_config.num_attention_heads),
-                headdim=self.config.head_dim,
-                page_size=256,
-                cu_seqlens_q=cu_seqlens_q,
-                causal=False,
-            )
+        #scheduler_metadata = get_scheduler_metadata(
+        #        batch_size=word_positions.shape[0],
+        #        max_seqlen_q=1,
+        #        max_seqlen_k=max_seqlen_k,
+        #        cache_seqlens=torch.zeros(0, device=word_positions.device, dtype=torch.int32),
+        #        num_heads_q=self.config.cross_attention_config.num_attention_heads,
+        #        num_heads_kv=getattr(self.config.cross_attention_config, "attention_num_kv_heads",
+        #                            self.config.cross_attention_config.num_attention_heads),
+        #        headdim=self.config.head_dim,
+        #        page_size=256,
+        #        cu_seqlens_q=cu_seqlens_q,
+        #        causal=False,
+        #    )
 
         updated_latent_word_embeddings = self.cross_attention_encoder_connector(
             q_position_ids=word_positions,
@@ -628,7 +624,7 @@ class HATEncoderConnector(nn.Module):
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
             force_attn=True,
-            scheduler_metadata=scheduler_metadata,
+            scheduler_metadata=None,
         )
         return updated_latent_word_embeddings
 

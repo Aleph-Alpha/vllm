@@ -277,6 +277,7 @@ class HATModelRunner(GPUModelRunner):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or (num_scheduled_tokens == hat_batch_input.word_positions.shape[0])
         use_cuda_graph = self.use_cuda_graph and decoder_cuda_graph and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
+        use_cuda_graph = use_cuda_graph and num_scheduled_tokens == 1
 
         if use_cuda_graph:
             # Use piecewise CUDA graphs.
