@@ -112,10 +112,14 @@ class HATManager:
 
             # L TODO: This will be set once for NewRequestData to True (if it is partial prefill) and then at some point
             # changed to False in process_outputs when we processed the last partial prefill of that request
-            if req_state.is_partial_prefill:
+            if req_state.is_partial_prefill or cached_req_data.resumed_from_preemption:
                 scheduler_output_byte.scheduled_cached_reqs.append(cached_req_data)
 
-                self._update_sequence(cached_req_data)
+                if cached_req_data.resumed_from_preemption:
+                    self._resume_preempted_sequence(cached_req_data, num_scheduled_tokens)
+                else:
+                    self._update_sequence(cached_req_data)
+
                 word_lens_bytes = self.req_ids_to_hat_state[req_id].word_lens_bytes
 
                 num_scheduled_tokens_backbone = len(word_lens_bytes) - 1
@@ -134,6 +138,7 @@ class HATManager:
                     scheduler_output_word.total_num_scheduled_tokens += num_scheduled_tokens_backbone
 
                 scheduler_output_word.finished_req_ids = scheduler_output.finished_req_ids
+            # Decoder at word boundary
             elif len(req_state.new_word_first_bytes) > 0:
                 self.req_ids_to_hat_state[req_id].word_lens_bytes = [1]
 
@@ -151,7 +156,7 @@ class HATManager:
                 scheduler_output_word.finished_req_ids = scheduler_output.finished_req_ids
                 
                 decode_cached_reqs_word_boundary_backbone.append(cached_req_data_backbone)
-                
+        
             else:
                 self.req_ids_to_hat_state[req_id].word_lens_bytes = [1]
                 decode_cached_reqs_not_word_boundary.append(cached_req_data)
@@ -248,7 +253,10 @@ class HATManager:
                 offset += word_lens_bytes[-1]
                 offset_beginning += num_bytes_excl_last_word + word_lens_bytes[-1]
                 
-                scheduler_output_byte_final_decoder.scheduled_new_reqs.append(scheduled_req)
+                if isinstance(scheduled_req, NewRequestData):
+                    scheduler_output_byte_final_decoder.scheduled_new_reqs.append(scheduled_req)
+                else:
+                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.append(scheduled_req)
                 scheduler_output_byte_final_decoder.num_scheduled_tokens[req_id] = req_state.num_scheduled_tokens_byte
                 scheduler_output_byte_final_decoder.total_num_scheduled_tokens += req_state.num_scheduled_tokens_byte
                 scheduler_output_byte_final_decoder.finished_req_ids = scheduler_output_byte.finished_req_ids
@@ -600,6 +608,55 @@ class HATManager:
             is_partial_prefill=is_partial_prefill,
             is_prefill=True,
             num_prompt_tokens=len(new_req_data.prompt_token_ids),
+            num_computed_tokens_backbone=0,
+            num_scheduled_tokens_byte=num_scheduled_tokens,
+            num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,
+            block_table_backbone=[],
+            len_last_word_chunked=0,
+            word_lens_bytes=word_lens_bytes,
+            prev_pred_backbone_embedding=self.first_word_embedding,
+            encoder_embeds_curr_word=[],
+            encoder_embeds_new_word=[],
+            word_position=torch.tensor(0, dtype=torch.int64, device=self.device),
+            word_position_cpu=0,
+            byte_position=0,
+        )
+        return num_scheduled_tokens_backbone
+    
+    def _resume_preempted_sequence(self, cached_req_data: CachedRequestData, num_scheduled_tokens: int):
+        """Initialises HATSequenceState for a preempted sequence
+
+        Returns:
+            List[int]: wordlens_bytes for the preempted sequence.
+        """
+        req_id = cached_req_data.req_id
+        req_state = self.req_ids_to_hat_state[req_id]
+        
+        text_words_bytes = split_text(self.hat_splitter, cached_req_data.new_token_ids)
+        
+        word_lens_bytes = [len(text_word_bytes) for text_word_bytes in text_words_bytes]
+
+        # P Could be byte_position + 1
+        is_partial_prefill = max(req_state.num_prompt_tokens, req_state.byte_position) > num_scheduled_tokens
+        
+        cu_word_lens_bytes = torch.cumsum(torch.tensor(word_lens_bytes), dim=0)
+        num_scheduled_tokens_backbone = int(torch.searchsorted(cu_word_lens_bytes,
+                                                                num_scheduled_tokens,
+                                                                right=False).item())
+        word_lens_bytes = word_lens_bytes[:num_scheduled_tokens_backbone+1]
+        
+        # curr_word_byes should be obtained from word_lens_bytes
+        offset = cu_word_lens_bytes[num_scheduled_tokens_backbone] - num_scheduled_tokens
+        offset = int(offset.item())
+        word_lens_bytes[-1] -= offset
+        curr_word_bytes = safe_list_slice(text_words_bytes[num_scheduled_tokens_backbone], offset)
+
+        self.req_ids_to_hat_state[req_id] = HATSequenceState(
+            curr_word_bytes=curr_word_bytes,
+            new_word_first_bytes=[],
+            is_partial_prefill=is_partial_prefill,
+            is_prefill=True,
+            num_prompt_tokens=req_state.num_prompt_tokens,
             num_computed_tokens_backbone=0,
             num_scheduled_tokens_byte=num_scheduled_tokens,
             num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,

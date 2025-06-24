@@ -262,6 +262,7 @@ class HATKVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        del self.req_id_to_hat_info[request.request_id]
         self.coordinator.free(request.request_id)
 
     def reset_prefix_cache(self) -> bool:
