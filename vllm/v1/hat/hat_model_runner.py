@@ -168,7 +168,7 @@ class HATModelRunner(GPUModelRunner):
                 mm_positions=new_req_data.mm_positions,
                 sampling_params=sampling_params,
                 generator=generator,
-                block_ids=new_req_data.block_ids,
+                block_ids=copy.deepcopy(new_req_data.block_ids),
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
@@ -236,7 +236,7 @@ class HATModelRunner(GPUModelRunner):
             if not req_data.resumed_from_preemption:
                 # Append the new blocks to the existing block IDs.
                 for i in range(len(self.kv_cache_config.kv_cache_groups)):
-                    req_state.block_ids[i].extend(req_data.new_block_ids[i])
+                    req_state.block_ids[i].extend(copy.deepcopy(req_data.new_block_ids[i]))
             else:
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
