@@ -303,7 +303,7 @@ class HATCrossAttention(nn.Module):
         output = torch.empty(shape, dtype=q.dtype, device=q.device)
         output = output.view(-1, self.num_heads, self.head_dim)
         torch.ops.vllm.run_cross_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, output, force_attn, scheduler_metadata)
-        output, _ = self.o_proj(output.view(-1, self.hidden_size))
+        output, _ = self.o_proj(output.view(shape))
 
         return output
     

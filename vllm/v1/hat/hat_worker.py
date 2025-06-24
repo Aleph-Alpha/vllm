@@ -124,7 +124,7 @@ class HATWorker(WorkerBase):
     
     def determine_available_memory(self) -> int:
         # TODO
-        return int(40e9)
+        return int(55e9)
     
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
@@ -250,7 +250,7 @@ class HATWorker(WorkerBase):
         if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) == 0 and len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) == 0:
             output = self.hat_manager.output
             self.hat_manager.reset_manager()
-            return output
+            return output if self.driver_rank == self.rank else None
 
         predictive_word_embeddings = None
         if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
@@ -292,7 +292,7 @@ class HATWorker(WorkerBase):
 
         output = self.hat_manager.output
         self.hat_manager.reset_manager()
-        return output
+        return output if self.driver_rank == self.rank else None
 
         ids = []
         for req in scheduler_output.scheduled_new_reqs:
@@ -404,7 +404,7 @@ class HATModelWorker(Worker):
                                             all_gather_group=get_tp_group())
             return None
 
-        return output if self.is_driver_worker else None
+        return output
             
         
 def _allocate_kv_cache_tensors(
