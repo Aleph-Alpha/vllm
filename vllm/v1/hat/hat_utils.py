@@ -114,8 +114,15 @@ def safe_list_slice(list: List, count: int, keep_prefix: bool=True) -> Optional[
             
 def split_text(hat_splitter: HATRuleSplitter, text_bytes: List[int]) -> List[List[int]]:
     """Splits a text into its constituent words in bytes."""
-    text = hat_splitter.decode(text_bytes, skip_special_tokens=False)
+    prev_num_bytes = len(text_bytes)
+    text = hat_splitter.decode(text_bytes, skip_special_tokens=False, errors="ignore")
     list_of_words_in_bytes = hat_splitter.encode(text)
+    after_num_bytes = sum(len(word) for word in list_of_words_in_bytes)
+    
+    diff = prev_num_bytes - after_num_bytes
+    if diff > 0:
+        # list_of_words_in_bytes[-1].extend(text_bytes[-diff:])
+        list_of_words_in_bytes.append(text_bytes[-diff:])
     return list_of_words_in_bytes
 
 

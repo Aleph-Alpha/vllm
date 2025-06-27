@@ -144,8 +144,9 @@ prompts_1 = [prompts_128[1]]
 # prompts_1 = ["An apple a day", "A cat is a dog and a dog is a cat"]
 #prompts_1 = ["The big horoscope"]
 # prompts_1 = ["Hel"]
+prompts_1 = ["🍎🍎🍎"]
 
-max_tokens = 20
+max_tokens = 2200
 sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
 
 format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -158,20 +159,20 @@ if __name__ == "__main__":
     #llm = LLM(model="/Models/hat_dpo",
           trust_remote_code=True,
           dtype=torch.bfloat16,
-          enforce_eager=False,
+          enforce_eager=True,
           compilation_config={"full_cuda_graph": False},
           tensor_parallel_size=1,
           gpu_memory_utilization=0.9,
           block_size=16,
           disable_cascade_attn=True,
-          max_num_batched_tokens=10000,
-          max_model_len=20000, # Can be set to 100k on A100
+          max_num_batched_tokens=4,
+          max_model_len=5000, # Can be set to 100k on A100
           max_num_seqs=4)
     
-    llm.start_profile()
-    outputs = llm.generate([format_llama(p) for p in prompts_1], sampling_params)
+    # llm.start_profile()
+    outputs = llm.generate([p for p in prompts_1], sampling_params)
     #outputs = llm.generate([p for p in prompts_1], sampling_params)
-    llm.stop_profile()
+    # llm.stop_profile()
 
     for output in outputs:
         prompt = output.prompt
