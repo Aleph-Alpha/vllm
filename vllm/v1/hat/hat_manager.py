@@ -517,8 +517,14 @@ class HATManager:
 
             is_new_word, words = check_byte_for_new_word(self.hat_splitter, curr_word_bytes)
             if is_new_word:
-                new_word_first_byte = req_state.curr_word_bytes.pop()
-                req_state.new_word_first_bytes = [new_word_first_byte]  
+                req_state.curr_word_bytes = words[0]
+                req_state.new_word_first_bytes = words[1]
+                
+                len_new_word = len(words[1])
+                # Multi byte characters
+                if len_new_word > 1:
+                    req_state.encoder_embeds_new_word = req_state.encoder_embeds_curr_word[-len_new_word+1:]
+                    req_state.encoder_embeds_curr_word = req_state.encoder_embeds_curr_word[:-len_new_word+1]
                 
     def process_outputs_enc_dec_loop(self, scheduled_cached_reqs: List[CachedRequestData], model_runner_output: ModelRunnerOutput) -> SchedulerOutput:
         """
@@ -560,8 +566,15 @@ class HATManager:
 
             is_new_word, words = check_byte_for_new_word(self.hat_splitter, curr_word_bytes)
             if is_new_word:
-                new_word_first_byte = req_state.curr_word_bytes.pop()
-                req_state.new_word_first_bytes = [new_word_first_byte]  
+                req_state.curr_word_bytes = words[0]
+                req_state.new_word_first_bytes = words[1]
+                
+                len_new_word = len(words[1])
+                # Multi byte characters
+                if len_new_word > 1:
+                    req_state.encoder_embeds_new_word = req_state.encoder_embeds_curr_word[-len_new_word+1:]
+                    req_state.encoder_embeds_curr_word = req_state.encoder_embeds_curr_word[:-len_new_word+1]
+                    
             else:
                 cached_req = CachedRequestData(
                     req_id=req_id,
