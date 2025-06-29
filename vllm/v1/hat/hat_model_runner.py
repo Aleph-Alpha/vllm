@@ -240,7 +240,7 @@ class HATModelRunner(GPUModelRunner):
             else:
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
-                req_state.block_ids = req_data.new_block_ids
+                req_state.block_ids = copy.deepcopy(req_data.new_block_ids)
 
             req_ids_to_add.append(req_id)
 
