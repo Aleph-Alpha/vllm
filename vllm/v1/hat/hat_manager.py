@@ -217,13 +217,14 @@ class HATManager:
                     )
                     offset += num_bytes_excl_last_word
 
-                    self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word = [
-                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
-                    ]
-                else:
-                    self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
-                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
-                    )
+                    # Usually encoder_embeds_new_word will be empty for chunked prefills except for the special case
+                    # where the chunked prefill occurs inside a multi-byte character split
+                    self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word = self.req_ids_to_hat_state[req_id].encoder_embeds_new_word
+                    self.req_ids_to_hat_state[req_id].encoder_embeds_new_word = []
+
+                self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
+                    encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
+                )
                     
                 offset += word_lens_bytes[-1]
                 offset_beginning += num_bytes_excl_last_word + word_lens_bytes[-1]
@@ -336,7 +337,7 @@ class HATManager:
                 word_lens_bytes_per_task_excl_last_word[-1][0] += req_state.len_last_word_chunked
 
                 num_bytes_last_word = req_state.word_lens_bytes[-1]
-                byte_positions.append(torch.arange(req_state.byte_position - req_state.len_last_word_chunked,
+                byte_positions.append(torch.arange(req_state.byte_position - req_state.len_last_word_chunked - req_state.multi_bytes,
                                                    req_state.byte_position + req_state.num_scheduled_tokens_byte - num_bytes_last_word,
                                                    device=self.device))
                 word_positions.append(torch.arange(req_state.word_position_cpu,
@@ -499,7 +500,6 @@ class HATManager:
                 req_state.is_partial_prefill = False
                 req_state.is_prefill = False
 
-            print(new_token_id)
             req_state.byte_position += req_state.num_scheduled_tokens_byte
             req_state.word_position += req_state.num_scheduled_tokens_backbone
             req_state.word_position_cpu += req_state.num_scheduled_tokens_backbone
@@ -626,6 +626,7 @@ class HATManager:
             num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,
             block_table_backbone=[],
             len_last_word_chunked=0,
+            multi_bytes=0,
             word_lens_bytes=word_lens_bytes,
             prev_pred_backbone_embedding=self.first_word_embedding,
             encoder_embeds_curr_word=[],
@@ -675,6 +676,7 @@ class HATManager:
             num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,
             block_table_backbone=[],
             len_last_word_chunked=0,
+            multi_bytes=0,
             word_lens_bytes=word_lens_bytes,
             prev_pred_backbone_embedding=self.first_word_embedding,
             encoder_embeds_curr_word=[],
@@ -698,13 +700,29 @@ class HATManager:
         
         # word_lens_bytes always only includes characters from this worker step
         word_lens_bytes = [len(text_word_bytes) for text_word_bytes in text_words_bytes]
-        word_lens_bytes[0] -= len(req_state.curr_word_bytes)
+
+        # Rare edge case where the chunked prefill occurs inside a multi-byte character split
+        # e.g. "🤔🤔🤔" and the chunked prefill has size 5
+        if len(req_state.curr_word_bytes) > word_lens_bytes[0] and len(word_lens_bytes) == 2:
+            multi_bytes = len(req_state.curr_word_bytes) - word_lens_bytes[0]
+            len_last_word_chunked = word_lens_bytes[0]
+            word_lens_bytes[0] = 0
+            curr_word_bytes = text_words_bytes[-1]
+            req_state.new_word_bytes = text_words_bytes[1]
+            full_curr_word_embeds = torch.cat(req_state.encoder_embeds_curr_word, dim=0)
+            req_state.encoder_embeds_new_word = [full_curr_word_embeds[-multi_bytes:]]
+            req_state.encoder_embeds_curr_word = [full_curr_word_embeds[:-multi_bytes]]
+        else:
+            multi_bytes = 0
+            len_last_word_chunked = len(req_state.curr_word_bytes)
+            word_lens_bytes[0] -= len(req_state.curr_word_bytes)
+            curr_word_bytes = text_words_bytes[-1]
+            
         req_state.word_lens_bytes = word_lens_bytes
         
-        curr_word_bytes = text_words_bytes[-1]
         # We overwrite curr_word_bytes with info from this worker step
         # encoder_curr_embeds still contains last possibly incomplete word 
         # from previous worker step
-        req_state.len_last_word_chunked = len(req_state.curr_word_bytes)
+        req_state.len_last_word_chunked = len_last_word_chunked
         req_state.curr_word_bytes = curr_word_bytes
-        # print("req_id", cached_req_data.req_id, "req_state.curr_word_bytes", req_state.curr_word_bytes)
+        req_state.multi_bytes = multi_bytes

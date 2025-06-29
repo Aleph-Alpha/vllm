@@ -22,6 +22,7 @@ class HATSequenceState:
     word_lens_bytes: List[int]
     num_scheduled_tokens_byte: int
     len_last_word_chunked: int
+    multi_bytes: int
 
     # Predictive word embedding from the previous word (needed by the decoder)
     prev_pred_backbone_embedding: Optional[torch.Tensor] # Shape [word_windwow_size, D]
@@ -121,8 +122,10 @@ def split_text(hat_splitter: HATRuleSplitter, text_bytes: List[int]) -> List[Lis
     
     diff = prev_num_bytes - after_num_bytes
     if diff > 0:
-        # list_of_words_in_bytes[-1].extend(text_bytes[-diff:])
-        list_of_words_in_bytes.append(text_bytes[-diff:])
+        if len(list_of_words_in_bytes) > 1:
+            list_of_words_in_bytes[-1].extend(text_bytes[-diff:])
+        else:
+            list_of_words_in_bytes = [text_bytes]
     return list_of_words_in_bytes
 
 
