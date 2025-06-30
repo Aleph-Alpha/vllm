@@ -249,9 +249,7 @@ class HATWorker(WorkerBase):
             self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec)
         
         if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) == 0 and len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) == 0:
-            output = self.hat_manager.output
-            self.hat_manager.reset_manager()
-            return output if self.driver_rank == self.rank else None
+            return self.hat_manager.finish_step()
 
         predictive_word_embeddings = None
         if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
@@ -291,9 +289,7 @@ class HATWorker(WorkerBase):
         self.hat_manager.process_outputs_enc_dec_loop(scheduled_cached_reqs_dec_word_boundary, model_runner_output)
         self.hat_manager.process_outputs_prefill_chunked_prefill(scheduler_output_byte_final_decoder, model_runner_output)
 
-        output = self.hat_manager.output
-        self.hat_manager.reset_manager()
-        return output if self.driver_rank == self.rank else None
+        return self.hat_manager.finish_step()
 
         ids = []
         for req in scheduler_output.scheduled_new_reqs:

@@ -33,10 +33,12 @@ class HATManager:
 
         self.first_word_embedding: torch.Tensor = None
         
-    def reset_manager(self):
+    def finish_step(self):
         self.num_decodes_not_word_boundary = 0
         self.num_decodes_word_boundary = 0
+        tmp_output = self.output
         self.output = _create_empty_model_runner_output()
+        return tmp_output if self.driver_rank == self.rank else None
     
     def add_request(self, scheduler_output: SchedulerOutput) -> Tuple[SchedulerOutput, SchedulerOutput]:
 
