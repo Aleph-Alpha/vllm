@@ -124,7 +124,7 @@ class HATWorker(WorkerBase):
     
     def determine_available_memory(self) -> int:
         # TODO
-        return int(2e9)
+        return int(40e9)
     
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
@@ -234,6 +234,7 @@ class HATWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
 
+        self.hat_manager.remove_finished_requests(scheduler_output)
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
         

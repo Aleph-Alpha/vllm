@@ -172,6 +172,10 @@ class HATManager:
         
         return scheduler_output_byte, scheduler_output_word
     
+    def remove_finished_requests(self, scheduler_output: SchedulerOutput):
+        for req_id in scheduler_output.finished_req_ids:
+            del self.req_ids_to_hat_state[req_id]
+
     def handle_encoder_output(self, scheduler_output_byte: SchedulerOutput,
                               encoder_hidden_states: torch.Tensor) -> Tuple[List[torch.Tensor],
                                                                             Optional[torch.Tensor],

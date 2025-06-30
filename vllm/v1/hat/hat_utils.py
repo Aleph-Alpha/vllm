@@ -120,6 +120,8 @@ def split_text(hat_splitter: HATRuleSplitter, text_bytes: List[int]) -> List[Lis
     list_of_words_in_bytes = hat_splitter.encode(text)
     after_num_bytes = sum(len(word) for word in list_of_words_in_bytes)
     
+    # For incomplete multi-byte characters, we need to add the remaining bytes to the last word
+    # This can happen for chunked prefills
     diff = prev_num_bytes - after_num_bytes
     if diff > 0:
         if len(list_of_words_in_bytes) > 1:
