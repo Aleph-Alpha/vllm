@@ -101,7 +101,6 @@ class HATManager:
 
             block_table_enc_dec = cached_req_data.new_block_ids[-1:]
             block_table_backbone = cached_req_data.new_block_ids[:-1]
-            req_state.block_table_backbone = block_table_backbone
             cached_req_data.new_block_ids = block_table_enc_dec
             
             # print("\n\nblock_table_enc_dec", block_table_enc_dec)
@@ -630,7 +629,6 @@ class HATManager:
             num_computed_tokens_backbone=0,
             num_scheduled_tokens_byte=num_scheduled_tokens,
             num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,
-            block_table_backbone=[],
             len_last_word_chunked=0,
             multi_bytes=0,
             word_lens_bytes=word_lens_bytes,
@@ -680,7 +678,6 @@ class HATManager:
             num_computed_tokens_backbone=0,
             num_scheduled_tokens_byte=num_scheduled_tokens,
             num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,
-            block_table_backbone=[],
             len_last_word_chunked=0,
             multi_bytes=0,
             word_lens_bytes=word_lens_bytes,
