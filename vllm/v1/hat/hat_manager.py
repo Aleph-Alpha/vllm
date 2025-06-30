@@ -344,7 +344,7 @@ class HATManager:
 
                 num_bytes_last_word = req_state.word_lens_bytes[-1]
                 byte_positions.append(torch.arange(req_state.byte_position - req_state.len_last_word_chunked - req_state.multi_bytes,
-                                                   req_state.byte_position + req_state.num_scheduled_tokens_byte - num_bytes_last_word,
+                                                   req_state.byte_position + req_state.num_scheduled_tokens_byte - num_bytes_last_word - req_state.multi_bytes,
                                                    device=self.device))
                 word_positions.append(torch.arange(req_state.word_position_cpu,
                                                    req_state.word_position_cpu + scheduler_output_word.num_scheduled_tokens[req_id],
@@ -513,7 +513,6 @@ class HATManager:
 
             if req_state.is_partial_prefill:
                 continue
-            req_state.num_prompt_tokens += 1
                 
             # Prefill case or last chunked prefill            
             curr_word_bytes = req_state.curr_word_bytes
@@ -565,7 +564,6 @@ class HATManager:
                 self.output.sampled_token_ids[req_id_index_output].append(new_token_id)
 
             req_state.byte_position += 1
-            req_state.num_prompt_tokens += 1
             curr_word_bytes = req_state.curr_word_bytes
             curr_word_bytes.append(new_token_id)
 
@@ -658,7 +656,8 @@ class HATManager:
         
         word_lens_bytes = [len(text_word_bytes) for text_word_bytes in text_words_bytes]
 
-        is_partial_prefill = req_state.num_prompt_tokens > num_scheduled_tokens
+        num_prompt_tokens = max(req_state.num_prompt_tokens, req_state.byte_position)
+        is_partial_prefill = num_prompt_tokens > num_scheduled_tokens
         
         cu_word_lens_bytes = torch.cumsum(torch.tensor(word_lens_bytes), dim=0)
         num_scheduled_tokens_backbone = int(torch.searchsorted(cu_word_lens_bytes,
@@ -677,7 +676,7 @@ class HATManager:
             new_word_first_bytes=[],
             is_partial_prefill=is_partial_prefill,
             is_prefill=not is_partial_prefill,
-            num_prompt_tokens=req_state.num_prompt_tokens,
+            num_prompt_tokens=num_prompt_tokens,
             num_computed_tokens_backbone=0,
             num_scheduled_tokens_byte=num_scheduled_tokens,
             num_scheduled_tokens_backbone=num_scheduled_tokens_backbone,
@@ -713,9 +712,11 @@ class HATManager:
         if len(req_state.curr_word_bytes) > word_lens_bytes[0] and len(word_lens_bytes) == 2:
             multi_bytes = len(req_state.curr_word_bytes) - word_lens_bytes[0]
             len_last_word_chunked = word_lens_bytes[0]
+            
             word_lens_bytes[0] = 0
+            word_lens_bytes[1] = len(cached_req_data.new_token_ids)
+            
             curr_word_bytes = text_words_bytes[-1]
-            req_state.new_word_bytes = text_words_bytes[1]
             full_curr_word_embeds = torch.cat(req_state.encoder_embeds_curr_word, dim=0)
             req_state.encoder_embeds_new_word = [full_curr_word_embeds[-multi_bytes:]]
             req_state.encoder_embeds_curr_word = [full_curr_word_embeds[:-multi_bytes]]
