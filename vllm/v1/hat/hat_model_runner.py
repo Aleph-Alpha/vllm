@@ -75,14 +75,8 @@ class HATModelRunner(GPUModelRunner):
         self.role: Optional[HATSubmodelRole] = None
 
         # Tensors for CUDA Graph Caching, set in load_model
-        
         self.previous_hidden_states: Optional[torch.Tensor] = None
         self.predictive_word_embeddings: Optional[torch.Tensor] = None
-        self.decoder_word_positions: Optional[torch.Tensor] = None
-
-        self.scheduler_metadata = torch.zeros(self.max_num_reqs + 1,
-                                              dtype=torch.int32,
-                                              device=self.device)
     
     def load_model(self) -> None:
         super().load_model()
@@ -97,10 +91,6 @@ class HATModelRunner(GPUModelRunner):
                 self.predictive_word_embeddings = torch.zeros(self.max_num_tokens,
                     self.model_config.hf_config.cross_attention_config.hidden_size_kv,
                     dtype=self.dtype,
-                    device=self.device)
-                self.decoder_word_positions = torch.zeros(
-                    self.max_num_tokens,
-                    dtype=torch.int64,
                     device=self.device)
             case HATSubmodelRole.BACKBONE:
                 self.previous_hidden_states = torch.zeros(self.max_num_tokens,
@@ -275,9 +265,9 @@ class HATModelRunner(GPUModelRunner):
             self._prepare_inputs(scheduler_output))
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or (num_scheduled_tokens == hat_batch_input.word_positions.shape[0])
+        decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or hat_batch_input.word_lens_bytes is None \
+            or hat_batch_input.word_lens_bytes.shape[0] == num_scheduled_tokens
         use_cuda_graph = self.use_cuda_graph and decoder_cuda_graph and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
-        use_cuda_graph = use_cuda_graph and num_scheduled_tokens == 1
 
         if use_cuda_graph:
             # Use piecewise CUDA graphs.
@@ -432,7 +422,6 @@ class HATModelRunner(GPUModelRunner):
             case HATSubmodelRole.DECODER:
                 self.previous_hidden_states[:num_scheduled_tokens, :].copy_(hat_batch_input.encoder_hidden_states, non_blocking=True)
                 self.predictive_word_embeddings[:num_scheduled_tokens, :].copy_(hat_batch_input.predictive_word_embeddings, non_blocking=True)
-                self.decoder_word_positions[:num_scheduled_tokens].copy_(hat_batch_input.word_positions, non_blocking=True)
             case HATSubmodelRole.BACKBONE:
                 self.previous_hidden_states[:num_scheduled_tokens, :].copy_(hat_batch_input.latent_word_embeddings, non_blocking=True)
             case HATSubmodelRole.ENCODER:
@@ -540,10 +529,10 @@ class HATModelRunner(GPUModelRunner):
             case HATSubmodelRole.DECODER:
                 model_kwargs = {
                     # Reuse input_ids for word positions, because the decoder does not need input_ids
-                    "input_ids": self.decoder_word_positions[:num_input_tokens],
+                    "input_ids": None,
                     "inputs_embeds": None,
                     "positions": self.positions[:num_input_tokens],
-                    "word_len_bytes": None,
+                    "word_lens_bytes": None,
                     "predictive_word_embeddings": self.predictive_word_embeddings[:num_input_tokens, :],
                     "previous_hidden_states": self.previous_hidden_states[:num_input_tokens, :],
                 }
@@ -574,20 +563,18 @@ class HATModelRunner(GPUModelRunner):
             case HATSubmodelRole.DECODER:
                 previous_hidden_states = hat_batch_input.encoder_hidden_states
                 predictive_word_embeddings = hat_batch_input.predictive_word_embeddings
-                word_positions = hat_batch_input.word_positions
-                word_len_bytes = hat_batch_input.word_len_bytes
+                word_lens_bytes = hat_batch_input.word_lens_bytes
                 if use_cuda_graph:
                     previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
                     predictive_word_embeddings = self.predictive_word_embeddings[:num_input_tokens, :]
-                    word_positions = self.decoder_word_positions[:num_input_tokens]
-                    word_len_bytes = None
+                    word_lens_bytes = None
 
                 model_kwargs = {
                     # Reuse input_ids for word positions, because the decoder does not need input_ids
-                    "input_ids": word_positions,
+                    "input_ids": None,
                     "inputs_embeds": None,
                     "positions": positions,
-                    "word_len_bytes": word_len_bytes,
+                    "word_lens_bytes": word_lens_bytes,
                     "predictive_word_embeddings": predictive_word_embeddings,
                     "previous_hidden_states": previous_hidden_states,
                 }

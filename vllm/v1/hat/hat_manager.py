@@ -423,31 +423,17 @@ class HATManager:
         return predictive_word_embeddings_final_decoder
     
     def prepare_input_final_decoder(self, scheduler_output_byte_final_decoder: SchedulerOutput) -> torch.Tensor: 
-        word_positions = []
-        word_lens_bytes_per_task = [[0]]
+        word_lens_bytes_per_task = []
         for scheduled_req in scheduler_output_byte_final_decoder.scheduled_new_reqs + scheduler_output_byte_final_decoder.scheduled_cached_reqs:
             req_id = scheduled_req.req_id
             req_state = self.req_ids_to_hat_state[req_id]
-            
-            if req_state.is_partial_prefill:
-                word_positions.append(torch.arange(req_state.word_position_cpu,
-                                                   req_state.word_position_cpu + req_state.num_scheduled_tokens_backbone + 1,
-                                                   device=self.device))
-            elif req_state.is_prefill:
-                word_positions.append(torch.arange(0, req_state.num_scheduled_tokens_backbone + 1,
-                                                   device=self.device))
-            # Decodes that reached the word boundary in the previous worker step
-            else:
-                word_positions.append(req_state.word_position)
-
             word_lens_bytes_per_task.append(req_state.word_lens_bytes)
             
         word_lens_bytes_per_task = torch.tensor(list(itertools.chain.from_iterable(word_lens_bytes_per_task)),
                                                 dtype=torch.int32).pin_memory()
         word_lens_bytes_per_task = word_lens_bytes_per_task.to(self.device, non_blocking=True)
-        word_positions = torch.hstack(word_positions)
         
-        return word_positions, word_lens_bytes_per_task
+        return word_lens_bytes_per_task
     
     def prepare_exec_model_req_for_dec_autoregressive_phase(self, scheduler_output_byte_enc_dec: SchedulerOutput) -> torch.Tensor:
         predictive_word_embeddings = [] 
@@ -459,12 +445,6 @@ class HATManager:
         predictive_word_embeddings = torch.cat(predictive_word_embeddings, dim=0)
         return predictive_word_embeddings
 
-    def compute_position_ids_decoder_autoregressive_phase(self, 
-                                                          scheduler_output_byte_enc_dec: SchedulerOutput) -> torch.Tensor:
-        tensors = [self.req_ids_to_hat_state[scheduled_req.req_id].word_position
-                   for scheduled_req in scheduler_output_byte_enc_dec.scheduled_cached_reqs]
-        return torch.hstack(tensors)
-                    
     def update_backbone_info(self, scheduler_output_word: SchedulerOutput):
         cached_reqs = safe_list_slice(scheduler_output_word.scheduled_cached_reqs, 
                                       self.num_decodes_word_boundary,

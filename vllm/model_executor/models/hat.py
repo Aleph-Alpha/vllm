@@ -38,58 +38,6 @@ from .utils import (AutoWeightsLoader,
                     maybe_prefix)
 
 
-def run_cross_attn(q: torch.Tensor,
-                   k: torch.Tensor,
-                   v: torch.Tensor,
-                   cu_seqlens_q: torch.Tensor,
-                   cu_seqlens_k: torch.Tensor,
-                   max_seqlen_q: int,
-                   max_seqlen_k: int,
-                   output: torch.Tensor,
-                   force_attn: bool = False,
-                   scheduler_metadata: Optional[torch.Tensor] = None) -> None:
-    #if not force_attn:
-    #    attn_metadata = get_forward_context().attn_metadata
-    #    if attn_metadata is None:
-    #        return torch.empty_like(q).contiguous()
-
-    flash_attn_varlen_func(
-        q=q,
-        k=k,
-        v=v,
-        out=output,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        fa_version=2,
-        scheduler_metadata=scheduler_metadata,
-        causal=False,
-    )
-
-
-def run_cross_attn_fake(q: torch.Tensor,
-                        k: torch.Tensor,
-                        v: torch.Tensor,
-                        cu_seqlens_q: torch.Tensor,
-                        cu_seqlens_k: torch.Tensor,
-                        max_seqlen_q: int,
-                        max_seqlen_k: int,
-                        output: torch.Tensor,
-                        force_attn: bool = False,
-                        scheduler_metadata: Optional[torch.Tensor] = None) -> None:
-    return
-    
-
-direct_register_custom_op(
-    op_name="run_cross_attn",
-    op_func=run_cross_attn,
-    mutates_args=["output"],
-    fake_impl=run_cross_attn_fake,
-    dispatch_key=current_platform.dispatch_key,
-)
-
-
 class HATAttention(nn.Module):
 
     def __init__(self,
@@ -300,13 +248,109 @@ class HATCrossAttention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
+
         output = torch.empty(shape, dtype=q.dtype, device=q.device)
         output = output.view(-1, self.num_heads, self.head_dim)
-        torch.ops.vllm.run_cross_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, output, force_attn, scheduler_metadata)
+        flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            fa_version=2,
+            scheduler_metadata=scheduler_metadata,
+            causal=False,
+        )
+
         output, _ = self.o_proj(output.view(shape))
 
         return output
     
+
+class HATGuideVectorAdd(nn.Module):
+
+    def __init__(self,
+                 config: PretrainedConfig,
+                 hidden_size: int,
+                 q_hidden_size: int,
+                 kv_hidden_size: int,
+                 num_heads: int,
+                 num_kv_heads: int,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 bias: bool = False,
+                 bias_o_proj: bool = False,
+                 cache_config: Optional[CacheConfig] = None,
+                 prefix: str = "") -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.q_hidden_size = q_hidden_size
+        self.kv_hidden_size = kv_hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        # MistralConfig has an optional head_dim introduced by Mistral-Nemo
+        self.head_dim = getattr(config, "head_dim",
+                                self.hidden_size // self.total_num_heads)
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        self.q_proj = ColumnParallelLinear(
+            input_size=self.q_hidden_size,
+            output_size=self.hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+
+        self.k_proj = ColumnParallelLinear(
+            input_size=self.kv_hidden_size,
+            output_size=self.hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+
+        self.v_proj = ColumnParallelLinear(
+            input_size=self.kv_hidden_size,
+            output_size=self.hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v_proj",
+        )
+
+        self.o_proj = RowParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.q_hidden_size,
+            bias=bias_o_proj,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+    def forward(
+        self,
+        word_embeddings: torch.Tensor,
+        word_lens_bytes: torch.Tensor,
+    ) -> torch.Tensor:
+        v, _ = self.v_proj(word_embeddings)
+        
+        if word_lens_bytes is not None:
+            v = v.repeat_interleave(word_lens_bytes, dim=0)
+        output, _ = self.o_proj(v)
+        return output
+
 
 class HATMLP(nn.Module):
 
@@ -438,14 +482,6 @@ class HATDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-                config, "original_max_position_embeddings", None):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
         
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
@@ -459,7 +495,7 @@ class HATDecoderLayer(nn.Module):
         self.kv_norm = RMSNorm(config.cross_attention_config.hidden_size_kv,
                                eps=config.rms_norm_eps)
 
-        self.cross_attention = HATCrossAttention(
+        self.cross_attention = HATGuideVectorAdd(
             config=config,
             hidden_size=config.cross_attention_config.hidden_size,
             q_hidden_size=config.cross_attention_config.hidden_size_q,
@@ -467,9 +503,6 @@ class HATDecoderLayer(nn.Module):
             num_heads=config.cross_attention_config.num_attention_heads,
             num_kv_heads=getattr(config.cross_attention_config, "attention_num_kv_heads",
                                  config.cross_attention_config.num_attention_heads),
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             bias=attention_bias,
             bias_o_proj=bias_o_proj,
@@ -487,12 +520,8 @@ class HATDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        word_positions: Optional[torch.Tensor],
+        word_lens_bytes: torch.Tensor,
         predictive_word_embeddings: Optional[torch.Tensor],
-        cu_seqlens_byte: torch.Tensor,
-        cu_seqlens_word: torch.Tensor,
-        max_seqlen_byte: int,
-        max_seqlen_word: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -502,33 +531,9 @@ class HATDecoderLayer(nn.Module):
                 hidden_states, residual)
         word_embeddings = self.kv_norm(predictive_word_embeddings)
 
-        #if positions.shape[0] == word_positions.shape[0]:
-        #scheduler_metadata = get_scheduler_metadata(
-        #        batch_size=hidden_states.shape[0],
-        #        max_seqlen_q=max_seqlen_byte,
-        #        max_seqlen_k=max_seqlen_word,
-        #        cache_seqlens=torch.zeros(0, device=word_positions.device, dtype=torch.int32),
-        #        num_heads_q=self.config.cross_attention_config.num_attention_heads,
-        #        num_heads_kv=getattr(self.config.cross_attention_config, "attention_num_kv_heads",
-        #                            self.config.cross_attention_config.num_attention_heads),
-        #        headdim=self.config.head_dim,
-        #        page_size=256,
-        #        cu_seqlens_q=cu_seqlens_byte,
-        #        causal=False,
-        #    )
-        #else:
-        #    scheduler_metadata = None
-
         hidden_states = self.cross_attention(
-            q_position_ids=positions,
-            q_input=hidden_states,
-            kv_input=word_embeddings,
-            kv_position_ids=word_positions,
-            cu_seqlens_q=cu_seqlens_byte,
-            cu_seqlens_k=cu_seqlens_word,
-            max_seqlen_q=max_seqlen_byte,
-            max_seqlen_k=max_seqlen_word,
-            scheduler_metadata=None,
+            word_embeddings=word_embeddings,
+            word_lens_bytes=word_lens_bytes,
         )
 
         hidden_states, residual = self.llama_layer(positions, hidden_states, residual)
@@ -786,11 +791,7 @@ class HATDecoderModel(nn.Module):
         self,
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        word_positions: Optional[torch.Tensor] = None,
+        word_lens_bytes: torch.Tensor,
         predictive_word_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = previous_hidden_states
@@ -798,8 +799,7 @@ class HATDecoderModel(nn.Module):
 
         for layer in self.decoder_layers:
             hidden_states, residual = layer(positions, hidden_states, residual,
-                                            word_positions, predictive_word_embeddings,
-                                            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+                                            word_lens_bytes, predictive_word_embeddings)
 
         if residual is not None:
             hidden_states = hidden_states + residual
@@ -879,25 +879,14 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
         self,
         positions: torch.Tensor,
         previous_hidden_states: Optional[torch.Tensor] = None,
-        word_len_bytes: Optional[torch.Tensor] = None,
+        word_lens_bytes: Optional[torch.Tensor] = None,
         predictive_word_embeddings: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
 
-        if word_len_bytes is None:
-            cu_seqlens_byte = torch.arange(positions.shape[0] + 1, device=positions.device, dtype=torch.int32)
-            max_seqlen_byte = 1
-        else:
-            cu_seqlens_byte = torch.cumsum(word_len_bytes, dim=0, dtype=torch.int32)
-            max_seqlen_byte = word_len_bytes.max()
-
-        cu_seqlens_word = torch.arange(input_ids.shape[0] + 1, device=input_ids.device, dtype=torch.int32)
-        max_seqlen_word = 1
-
-        model_output = self.decoder(positions, previous_hidden_states, cu_seqlens_byte, cu_seqlens_word,
-                                    max_seqlen_byte, max_seqlen_word, input_ids, predictive_word_embeddings)
+        model_output = self.decoder(positions, previous_hidden_states, word_lens_bytes, predictive_word_embeddings)
         model_output = self.layer_norm(model_output)
         return model_output
 
@@ -1036,8 +1025,6 @@ def _load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]
         ("self_attn.qkv_proj", "self_attn.v_proj", "v"),
         ("cross_attention_encoder_connector.kv_proj", "cross_attention_encoder_connector.k_proj", "k"),
         ("cross_attention_encoder_connector.kv_proj", "cross_attention_encoder_connector.v_proj", "v"),
-        ("cross_attention.kv_proj", "cross_attention.k_proj", "k"),
-        ("cross_attention.kv_proj", "cross_attention.v_proj", "v"),
         (".gate_up_proj", ".gate_proj", 0),
         (".gate_up_proj", ".up_proj", 1),
     ]
