@@ -45,12 +45,6 @@ class HATKVCacheManager:
         self.log_stats = log_stats
         # FIXME: make prefix cache stats conditional on log_stats
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
-        assert len(
-            set(g.kv_cache_spec.block_size
-                for g in kv_cache_config.kv_cache_groups)
-        ) == 1, "Only one block size is supported for now"
-        self.block_size = kv_cache_config.kv_cache_groups[
-            0].kv_cache_spec.block_size
 
         self.coordinator = HATKVCacheCoordinator(
             kv_cache_config=kv_cache_config,

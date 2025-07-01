@@ -124,16 +124,23 @@ class HATWorker(WorkerBase):
     
     def determine_available_memory(self) -> int:
         # TODO
-        return int(40e9)
+        return int(2e9)
     
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
         encoder_spec = self.encoder_worker.get_kv_cache_spec()
+        sliding_window_spec_example = encoder_spec[next(iter(encoder_spec.keys()))]
         decoder_spec = self.decoder_worker.get_kv_cache_spec()
         backbone_spec = self.backbone_worker.get_kv_cache_spec()
+        full_attention_spec_example = backbone_spec[next(iter(backbone_spec.keys()))]
+        
+        ratio = int(sliding_window_spec_example.page_size_bytes / full_attention_spec_example.page_size_bytes) 
+        for layer_name, layer_spec in backbone_spec.items():
+            layer_spec.block_size *= ratio
         
         encoder_spec.update(decoder_spec)
         encoder_spec.update(backbone_spec)
+        
         return encoder_spec
     
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
