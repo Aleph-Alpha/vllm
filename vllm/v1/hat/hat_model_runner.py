@@ -24,7 +24,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
 from vllm.distributed.parallel_state import (
     get_pp_group, get_tp_group, graph_capture,
-    prepare_communication_buffer_for_model)
+    prepare_communication_buffer_for_model, GraphCaptureContext)
 from vllm.forward_context import (DPMetadata, get_forward_context,
                                   set_forward_context)
 from vllm.logger import init_logger
@@ -38,7 +38,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LazyLoader, async_tensor_h2d, cdiv,
-                        check_use_alibi, is_pin_memory_available)
+                        check_use_alibi, is_pin_memory_available, weak_ref_tensor)
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.core.sched.output import NewRequestData
@@ -77,6 +77,10 @@ class HATModelRunner(GPUModelRunner):
         # Tensors for CUDA Graph Caching, set in load_model
         self.previous_hidden_states: Optional[torch.Tensor] = None
         self.predictive_word_embeddings: Optional[torch.Tensor] = None
+
+        self.graphs = {}
+        self.graph_memory_pool: Optional[Tuple[
+            int, int]] = None  # Set during graph capture.
     
     def load_model(self) -> None:
         super().load_model()
@@ -309,7 +313,11 @@ class HATModelRunner(GPUModelRunner):
                                  num_tokens_across_dp=num_tokens_across_dp):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            model_output = self.model(**model_kwargs)
+            if use_cuda_graph:
+                graph, model_output = self.graphs[num_input_tokens]
+                graph.replay()
+            else:
+                model_output = self.model(**model_kwargs)
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
@@ -510,6 +518,134 @@ class HATModelRunner(GPUModelRunner):
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         return outputs[logit_indices]
+    
+    @torch.inference_mode()
+    def _capture(
+        self,
+        num_tokens: int,
+        graph_capture_context: GraphCaptureContext,
+    ) -> torch.Tensor:
+
+        # Padding for DP
+        num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+        num_tokens += num_pad
+
+        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+        # for dummy run with LoRA so that the num_reqs collectively
+        # has num_tokens in total.
+        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert len(num_scheduled_tokens_list) == num_reqs
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list,
+                                        dtype=np.int32)
+
+        query_start_loc = self.query_start_loc[:num_reqs + 1]
+        # Make sure max_model_len is used at the graph capture time.
+        self.seq_lens_np[:num_reqs] = self.max_model_len
+        self.seq_lens_np[num_reqs:] = 0
+        self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+                                        non_blocking=True)
+        seq_lens = self.seq_lens[:num_reqs]
+
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc, seq_lens=seq_lens)
+
+        attn_metadata = {}
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(
+                self.kv_cache_config.kv_cache_groups):
+            attn_metadata_i = (
+                self.attn_metadata_builders[kv_cache_group_id].build(
+                    num_reqs=num_reqs,
+                    num_actual_tokens=num_tokens,
+                    max_query_len=num_tokens,
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                ))
+            for layer_name in kv_cache_group_spec.layer_names:
+                attn_metadata[layer_name] = attn_metadata_i
+
+        model = self.model
+        model_kwargs = self._get_dummy_model_kwargs(num_tokens)
+
+        if get_pp_group().is_first_rank:
+            intermediate_tensors = None
+        else:
+            if self.intermediate_tensors is None:
+                self.intermediate_tensors = (
+                    self.model.make_empty_intermediate_tensors(
+                        batch_size=self.max_num_tokens,
+                        dtype=self.model_config.dtype,
+                        device=self.device))
+
+            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                num_tokens, None, False)
+
+        torch.cuda.synchronize()
+        # Capture the graph.
+        graph = torch.cuda.CUDAGraph()
+        with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp):
+            with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=graph_capture_context.stream):
+                outputs = model(
+                    **model_kwargs,
+                    intermediate_tensors=intermediate_tensors,
+                )
+                if isinstance(outputs, torch.Tensor):
+                    graph_outputs = weak_ref_tensor(
+                        outputs)
+                elif isinstance(outputs, IntermediateTensors):
+                    graph_outputs = IntermediateTensors(
+                        tensors={
+                            key: weak_ref_tensor(value)
+                            for key, value in
+                            outputs.tensors.items()
+                        })
+                
+
+                del outputs
+                gc.collect()
+            self.graph_memory_pool = graph.pool()
+
+        torch.cuda.synchronize()
+        self.graphs[num_tokens] = (graph, graph_outputs)
+        logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        return graph_outputs[logit_indices]
+
+    def capture_model(self) -> None:
+        if not self.use_cuda_graph:
+            logger.warning(
+                "Skipping CUDA graph capture. Please add "
+                "-O %s to use CUDA graphs.", CompilationLevel.PIECEWISE)
+            return
+
+        start_time = time.perf_counter()
+        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+
+        # Trigger CUDA graph capture for specific shapes.
+        # Capture the large shapes first so that the smaller shapes
+        # can reuse the memory pool allocated for the large shapes.
+        with graph_capture(device=self.device) as graph_capture_context:
+            for num_tokens in reversed(self.cudagraph_batch_sizes):
+                for _ in range(self.vllm_config.compilation_config.
+                               cudagraph_num_of_warmups):
+                    self._dummy_run(num_tokens, skip_attn=False)
+                self._capture(num_tokens, graph_capture_context)
+
+        end_time = time.perf_counter()
+        end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        elapsed_time = end_time - start_time
+        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        # This usually takes 5~20 seconds.
+        logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
+                    elapsed_time, cuda_graph_size / (1 << 30))
 
     def _get_dummy_model_kwargs(self, num_input_tokens: int) -> dict[str, Any]:
         match self.role:

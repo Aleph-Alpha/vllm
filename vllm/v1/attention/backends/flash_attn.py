@@ -180,10 +180,11 @@ class FlashAttentionMetadataBuilder(
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = (get_flash_attn_version() == 3)
         self.use_full_cuda_graph = compilation_config.full_cuda_graph
+
         if self.use_full_cuda_graph:
-            if not self.aot_schedule:
-                raise ValueError(
-                    "AoT scheduling is required for full cuda graph.")
+            #if not self.aot_schedule:
+            #    raise ValueError(
+            #        "AoT scheduling is required for full cuda graph.")
             capture_sizes = compilation_config.cudagraph_capture_sizes
             if not capture_sizes:
                 raise ValueError(
@@ -342,16 +343,17 @@ class FlashAttentionMetadataBuilder(
                                           max_seq_len=max_seq_len,
                                           causal=True)
 
-        if self.use_full_cuda_graph:
-            assert scheduler_metadata is not None
-            n = scheduler_metadata.shape[0]
-            self.scheduler_metadata[:n] = scheduler_metadata
-            # NOTE(woosuk): We should zero out the rest of the scheduler
-            # metadata to guarantee the correctness. Otherwise, some thread
-            # blocks may use the invalid scheduler metadata and overwrite the
-            # output buffer.
-            self.scheduler_metadata[n:] = 0
-            scheduler_metadata = self.scheduler_metadata[:n]
+        #if self.use_full_cuda_graph:
+        #    assert scheduler_metadata is not None
+        #    n = scheduler_metadata.shape[0]
+        #    self.scheduler_metadata[:n].copy_(scheduler_metadata,
+        #                                      non_blocking=True)
+        #    # NOTE(woosuk): We should zero out the rest of the scheduler
+        #    # metadata to guarantee the correctness. Otherwise, some thread
+        #    # blocks may use the invalid scheduler metadata and overwrite the
+        #    # output buffer.
+        #    self.scheduler_metadata[n:] = 0
+        #    scheduler_metadata = self.scheduler_metadata[:n]
 
         max_num_splits = 0
         if (self.use_full_cuda_graph
