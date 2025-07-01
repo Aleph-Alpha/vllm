@@ -346,9 +346,9 @@ class HATGuideVectorAdd(nn.Module):
     ) -> torch.Tensor:
         v, _ = self.v_proj(word_embeddings)
         
-        if word_lens_bytes is not None:
-            v = v.repeat_interleave(word_lens_bytes, dim=0)
         output, _ = self.o_proj(v)
+        if word_lens_bytes is not None:
+            output = output.repeat_interleave(word_lens_bytes, dim=0)
         return output
 
 
