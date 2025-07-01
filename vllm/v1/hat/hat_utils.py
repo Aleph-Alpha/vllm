@@ -14,8 +14,6 @@ class HATSequenceState:
     # Store bytes of the current word and first byte of new word
     curr_word_bytes: List[int]
     new_word_first_bytes: Optional[List[int]]
-    is_partial_prefill: bool
-    is_prefill: bool
     num_prompt_tokens: int # for preempt, includes previously computed decode tokens
     num_computed_tokens_backbone: int
     num_scheduled_tokens_backbone: int
@@ -35,6 +33,8 @@ class HATSequenceState:
     word_position: torch.Tensor
     word_position_cpu: int
     byte_position: int
+    
+    request_type: "HATRequestType"
 
 
 @dataclass
@@ -57,6 +57,13 @@ class HATSubmodelRole(str, Enum):
     DECODER = "decoder"
     BACKBONE = "backbone"
 
+
+class HATRequestType(str, Enum):
+    PREFILL = "prefill"
+    CHUNKED_PREFILL = "chunked_prefill"
+    DECODE = "decode"
+    DECODE_WORD_BOUNDARY = "decode_word_boundary"
+    
     
 def _create_empty_scheduler_output() -> SchedulerOutput:
     return SchedulerOutput(
