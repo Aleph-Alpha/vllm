@@ -7,6 +7,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.outputs import ModelRunnerOutput
 
+COMPRESSION_RATIO = 4
 
 @dataclass
 class HATSequenceState:

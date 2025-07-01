@@ -42,7 +42,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.hat.hat_utils import HATBatchInput, HATSubmodelRole
+from vllm.v1.hat.hat_utils import COMPRESSION_RATIO, HATBatchInput, HATSubmodelRole
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
                                         SlidingWindowSpec)
@@ -101,6 +101,8 @@ class HATModelRunner(GPUModelRunner):
                     self.model_config.hf_config.hidden_size,
                     dtype=self.dtype,
                     device=self.device)
+                # Backbone 
+                self.max_num_tokens //= COMPRESSION_RATIO
 
     def register_request(self, new_req_data: NewRequestData) -> None:
         req_id = new_req_data.req_id
@@ -518,6 +520,16 @@ class HATModelRunner(GPUModelRunner):
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         return outputs[logit_indices]
+    
+    def profile_run(self) -> None:
+        hidden_states = self._dummy_run(self.max_num_tokens)
+        if get_pp_group().is_last_rank and self.role == HATSubmodelRole.DECODER:
+            sampler_output = self._dummy_sampler_run(hidden_states)
+        else:
+            sampler_output = None
+        self._sync_device()
+        del hidden_states, sampler_output
+        gc.collect()
     
     @torch.inference_mode()
     def _capture(
