@@ -142,11 +142,11 @@ prompts_4 = prompts_128[:4]
 prompts_2 = prompts_128[:2]
 prompts_1 = [prompts_128[1]]
 # prompts_1 = ["An apple a day", "A cat is a dog and a dog is a cat"]
-prompts_1 = ["The big horoscope"]
+#prompts_1 = ["The big horoscope"]
 # prompts_1 = ["Hel"]
 # prompts_1 = ["🍎🍎🍎"]
 
-max_tokens = 1000
+max_tokens = 5000
 sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
 
 format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -155,25 +155,25 @@ You are a helpful assistant. You give engaging, well-structured answers to user 
     
 if __name__ == "__main__":
     #llm = LLM(model="/nfs/checkpoint-tuning/llama3_hf/Meta-Llama-3.1-8B-Instruct/",
-    # llm = LLM(model="/nfs/scratch-aa/hat_vllm/dpo",
+    llm = LLM(model="/nfs/scratch-aa/hat_vllm/dpo",
     #llm = LLM(model="/Models/hat_dpo",
-    llm = LLM(model="/nfs/checkpoint-tuning/vedant/hat-70b-base/llama-3_1-70B-hatified-nolc-base",
+    #llm = LLM(model="/nfs/checkpoint-tuning/vedant/hat-70b-base/llama-3_1-70B-hatified-nolc-base",
     # llm = LLM(model="/nfs/scratch_2/felix.berkenkamp/70b_converted",
           trust_remote_code=True,
           dtype=torch.bfloat16,
           enforce_eager=True,
           compilation_config={"full_cuda_graph": False},
-          tensor_parallel_size=2,
+          tensor_parallel_size=1,
           gpu_memory_utilization=0.9,
           block_size=16,
           disable_cascade_attn=True,
-          max_num_batched_tokens=400,
-          max_model_len=5000, # Can be set to 100k on A100
-          max_num_seqs=4)
+          max_num_batched_tokens=100,
+          max_model_len=100000, # Can be set to 100k on A100
+          max_num_seqs=64)
     
     # llm.start_profile()
-    outputs = llm.generate([p for p in prompts_1], sampling_params)
-    #outputs = llm.generate([p for p in prompts_1], sampling_params)
+    #outputs = llm.generate([format_llama(p) for p in prompts_1], sampling_params)
+    outputs = llm.generate([p for p in prompts_64], sampling_params)
     # llm.stop_profile()
 
     for output in outputs:

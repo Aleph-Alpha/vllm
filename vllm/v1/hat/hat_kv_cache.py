@@ -159,16 +159,19 @@ class HATKVCacheManager:
         new_slots_needed_backbone = 0
         if req_id not in self.req_id_to_hat_info:
             self.req_id_to_hat_info[req_id] = HATKVCacheState(num_curr_word_bytes=0, num_computed_tokens_backbone=0, num_computed_tokens_byte=0)
-            words = split_text(self.hat_splitter, request._all_token_ids)
-            new_slots_needed_backbone = len(words)
+            words = split_text(self.hat_splitter, request._all_token_ids[:num_new_tokens])
+            new_slots_needed_backbone = len(words) - 1
             
             self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[-1])
             self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone = new_slots_needed_backbone
-            self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte = len(request._all_token_ids)
+            self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte = num_new_tokens
             
         else:
-            num_relevant_bytes_step = len(request._all_token_ids) - self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte + self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
-            words = split_text(self.hat_splitter, request._all_token_ids[-num_relevant_bytes_step:])
+            if len(request._all_token_ids) - request.num_computed_tokens == 1:
+                num_new_tokens = len(request._all_token_ids) - self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte
+            start_idx = self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte - self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
+            offset = num_new_tokens + self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
+            words = split_text(self.hat_splitter, request._all_token_ids[start_idx:start_idx + offset])
             
             if len(words) > 1:
                 self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[-1])
@@ -177,7 +180,7 @@ class HATKVCacheManager:
             else:
                 self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[0])
                 
-            self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte = len(request._all_token_ids)
+            self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte += num_new_tokens
         
         num_tokens_backbone = self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone
         

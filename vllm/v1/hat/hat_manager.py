@@ -1,6 +1,7 @@
 import itertools
 from typing import Dict, List, Optional, Tuple
 import torch
+from vllm.config import VllmConfig
 from vllm.sequence import ExecuteModelRequest
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.hat.hat_model_runner import HATModelRunner
@@ -12,14 +13,16 @@ from vllm.v1.outputs import ModelRunnerOutput
 class HATManager:
 
     def __init__(self, 
-                 special_token_dict: Dict[str, int],
-                 max_word_size: int,
+                 vllm_config: VllmConfig,
                  backbone_model_runner: HATModelRunner,
                  device: torch.device,
                  rank: int,
                  driver_rank: int):
+        self.vllm_config = vllm_config
+        self.max_model_len = vllm_config.model_config.max_model_len
         self.req_ids_to_hat_state: Dict[str, HATSequenceState] = {}
-        self.hat_splitter = HATRuleSplitter(special_token_dict, max_word_size=max_word_size)
+        self.hat_splitter = HATRuleSplitter(vllm_config.model_config.hf_config.special_token_dict,
+                                            max_word_size=vllm_config.model_config.hf_config.max_word_size)
         self.backbone_model_runner = backbone_model_runner
         self.device = device
         self.rank = rank
@@ -584,7 +587,7 @@ class HATManager:
                         req_state.encoder_embeds_curr_word = req_state.encoder_embeds_curr_word[:-len_new_word+1]
                 else:
                     req_state.new_word_first_bytes = [req_state.curr_word_bytes.pop()]
-            else:
+            elif req_state.byte_position + 1 < self.max_model_len:
                 req_state.request_type = HATRequestType.DECODE
                 cached_req = CachedRequestData(
                     req_id=req_id,

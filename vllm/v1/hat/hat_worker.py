@@ -191,8 +191,7 @@ class HATWorker(WorkerBase):
         filtered_kv_caches_backbone = {k: v for k, v in kv_caches.items() if k in backbone_forward_context}
         bind_kv_cache(filtered_kv_caches_backbone, backbone_forward_context, self.backbone_model_runner.kv_caches)
 
-        self.hat_manager = HATManager(special_token_dict=self.vllm_config.model_config.hf_config.special_token_dict,
-                                      max_word_size = self.vllm_config.model_config.hf_config.max_word_size,
+        self.hat_manager = HATManager(vllm_config=self.vllm_config,
                                       backbone_model_runner=self.backbone_model_runner,
                                       device=self.device,
                                       rank=self.rank,
@@ -280,7 +279,7 @@ class HATWorker(WorkerBase):
         
         word_lens_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
         
-        if self.steps == 2:
+        if self.steps == 10:
             #exit()
             pass
         self.steps += 1
