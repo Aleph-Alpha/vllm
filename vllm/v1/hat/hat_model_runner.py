@@ -101,8 +101,6 @@ class HATModelRunner(GPUModelRunner):
                     self.model_config.hf_config.hidden_size,
                     dtype=self.dtype,
                     device=self.device)
-                # Backbone 
-                self.max_num_tokens //= COMPRESSION_RATIO
 
     def register_request(self, new_req_data: NewRequestData) -> None:
         req_id = new_req_data.req_id
@@ -522,7 +520,7 @@ class HATModelRunner(GPUModelRunner):
         return outputs[logit_indices]
     
     def profile_run(self) -> None:
-        hidden_states = self._dummy_run(self.max_num_tokens)
+        hidden_states = self._dummy_run(max(1, self.max_num_tokens // COMPRESSION_RATIO) if self.role == HATSubmodelRole.BACKBONE else self.max_num_tokens)
         if get_pp_group().is_last_rank and self.role == HATSubmodelRole.DECODER:
             sampler_output = self._dummy_sampler_run(hidden_states)
         else:
