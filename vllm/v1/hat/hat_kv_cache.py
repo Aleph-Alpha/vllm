@@ -83,7 +83,11 @@ class HATKVCacheManager:
         Returns:
             The current prefix caching stats, or None if logging is disabled.
         """
-        return None
+        if not self.log_stats:
+            return None
+        stats = self.prefix_cache_stats
+        self.prefix_cache_stats = PrefixCacheStats()
+        return stats
 
     def get_computed_blocks(self,
                             request: Request) -> tuple[KVCacheBlocks, int]:
