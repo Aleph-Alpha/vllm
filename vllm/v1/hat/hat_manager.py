@@ -527,15 +527,18 @@ class HATManager:
             is_new_word, words = check_byte_for_new_word(self.hat_splitter, curr_word_bytes)
             if is_new_word:
                 req_state.request_type = HATRequestType.DECODE_WORD_BOUNDARY
-                req_state.curr_word_bytes = words[0]
-                req_state.new_word_first_bytes = words[1]
-                
-                len_new_word = len(words[1])
-                # Multi byte characters
-                if len_new_word > 1:
-                    req_state.encoder_embeds_new_word = req_state.encoder_embeds_curr_word[-len_new_word+1:]
-                    req_state.encoder_embeds_curr_word = req_state.encoder_embeds_curr_word[:-len_new_word+1]
-                
+                if words:
+                    req_state.curr_word_bytes = words[0]
+                    req_state.new_word_first_bytes = words[1]
+                    
+                    len_new_word = len(words[1])
+                    # Multi byte characters
+                    if len_new_word > 1:
+                        req_state.encoder_embeds_new_word = req_state.encoder_embeds_curr_word[-len_new_word+1:]
+                        req_state.encoder_embeds_curr_word = req_state.encoder_embeds_curr_word[:-len_new_word+1]
+                else:
+                    req_state.new_word_first_bytes = [req_state.curr_word_bytes.pop()]
+
     def process_outputs_enc_dec_loop(self, scheduled_cached_reqs: List[CachedRequestData], model_runner_output: ModelRunnerOutput) -> SchedulerOutput:
         """
         - Take out decodes which have reached word boundary from SchedulerOutput. This means updating `scheduled_cached_reqs`, `num_scheduled_tokens`
