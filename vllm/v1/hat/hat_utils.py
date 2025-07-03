@@ -31,7 +31,7 @@ class HATSequenceState:
 
     # Byte and word position of the current sequence we are generating tokens for
     word_position: torch.Tensor
-    word_position_cpu: int
+    word_position_cpu: torch.Tensor
     byte_position: int
     
     request_type: "HATRequestType"

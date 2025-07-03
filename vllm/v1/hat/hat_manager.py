@@ -356,26 +356,23 @@ class HATManager:
 
                     num_bytes_last_word = req_state.word_lens_bytes[-1]
                     byte_positions.append(torch.arange(req_state.byte_position - req_state.len_last_word_chunked - req_state.multi_bytes,
-                                                    req_state.byte_position + req_state.num_scheduled_tokens_byte - num_bytes_last_word - req_state.multi_bytes,
-                                                    device=self.device))
+                                                    req_state.byte_position + req_state.num_scheduled_tokens_byte - num_bytes_last_word - req_state.multi_bytes))
                     word_positions.append(torch.arange(req_state.word_position_cpu,
-                                                    req_state.word_position_cpu + scheduler_output_word.num_scheduled_tokens[req_id],
-                                                    device=self.device))
+                                                    req_state.word_position_cpu + scheduler_output_word.num_scheduled_tokens[req_id]))
                     
                 case HATRequestType.PREFILL:
                     # word_lens_bytes_per_task.append(req_state.word_lens_bytes)
                     num_bytes_last_word = req_state.word_lens_bytes[-1]
                     word_lens_bytes_per_task_excl_last_word.append(req_state.word_lens_bytes[:-1])
-                    byte_positions.append(torch.arange(0, req_state.num_scheduled_tokens_byte - num_bytes_last_word, device=self.device))
-                    word_positions.append(torch.arange(0, scheduler_output_word.num_scheduled_tokens[req_id], device=self.device))
+                    byte_positions.append(torch.arange(0, req_state.num_scheduled_tokens_byte - num_bytes_last_word))
+                    word_positions.append(torch.arange(0, scheduler_output_word.num_scheduled_tokens[req_id]))
                     
                 case HATRequestType.DECODE_WORD_BOUNDARY:
                     # word_len_bytes_per_task only needed for final decoder
                     word_lens_bytes_per_task_excl_last_word.append([len(req_state.curr_word_bytes)])
                     byte_positions.append(torch.arange(req_state.byte_position - len(req_state.curr_word_bytes),
-                                                    req_state.byte_position,
-                                                    device=self.device))
-                    word_positions.append(req_state.word_position)
+                                                    req_state.byte_position))
+                    word_positions.append(req_state.word_position_cpu)
                     
                     encoder_hidden_states_encoder_connector.extend(req_state.encoder_embeds_curr_word)       
                 
@@ -387,8 +384,8 @@ class HATManager:
         word_lens_bytes_per_task_excl_last_word = torch.tensor(list(itertools.chain.from_iterable(word_lens_bytes_per_task_excl_last_word)),
                                                                dtype=torch.int32)
         word_lens_bytes_per_task_excl_last_word = word_lens_bytes_per_task_excl_last_word.to(self.device, non_blocking=True)
-        byte_positions = torch.hstack(byte_positions)
-        word_positions = torch.hstack(word_positions)
+        byte_positions = torch.hstack(byte_positions).to(self.device, non_blocking=True)
+        word_positions = torch.hstack(word_positions).to(self.device, non_blocking=True)
 
         return encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions
     
@@ -646,7 +643,7 @@ class HATManager:
             encoder_embeds_curr_word=[],
             encoder_embeds_new_word=[],
             word_position=torch.tensor(0, dtype=torch.int64, device=self.device),
-            word_position_cpu=0,
+            word_position_cpu=torch.tensor(0, dtype=torch.int64),
             byte_position=0,
             request_type=request_type,
         )
@@ -695,7 +692,7 @@ class HATManager:
             encoder_embeds_curr_word=[],
             encoder_embeds_new_word=[],
             word_position=torch.tensor(0, dtype=torch.int64, device=self.device),
-            word_position_cpu=0,
+            word_position_cpu=torch.tensor(0, dtype=torch.int64),
             byte_position=0,
             request_type=request_type,
         )
