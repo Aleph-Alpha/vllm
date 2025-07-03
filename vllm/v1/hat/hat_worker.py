@@ -22,6 +22,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from transformers import PretrainedConfig
 import copy
 
+
 logger = init_logger(__name__)
 
 
@@ -86,9 +87,6 @@ class HATWorker(WorkerBase):
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
 
-        #self.text = "An Apple a day keeps the doctor away"
-        self.text = "🚀🎉🔥⭐".encode("utf-8")
-        self.idx = 0
         self.steps = 0
 
         if envs.VLLM_TORCH_PROFILER_DIR:
@@ -117,7 +115,6 @@ class HATWorker(WorkerBase):
         self.encoder_model_runner = self.encoder_worker.model_runner
         self.decoder_model_runner = self.decoder_worker.model_runner
         self.backbone_model_runner = self.backbone_worker.model_runner
-        self.first = True
     
     def load_model(self) -> None:
         pass
@@ -264,8 +261,6 @@ class HATWorker(WorkerBase):
                 self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
             )
 
-
-            #scheduler_metadata = torch.zeros(word_positions.shape[0], dtype=torch.int32, device=self.device)
             updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
                                                                     byte_positions,
                                                                     word_positions,
@@ -297,32 +292,6 @@ class HATWorker(WorkerBase):
 
         return self.hat_manager.finish_step()
 
-        ids = []
-        for req in scheduler_output.scheduled_new_reqs:
-            ids.append(req.req_id)
-        for req in scheduler_output.scheduled_cached_reqs:
-            ids.append(req.req_id)
-        
-        sampled_token_ids = []
-        for _ in ids:
-            samples = []
-            for _ in range(1):
-                samples.append(98)
-                #sampled_token_ids.append(self.text[self.idx])
-                self.idx = (self.idx + 1) % len(self.text)
-            sampled_token_ids.append(samples)
-
-        output = ModelRunnerOutput(
-            req_ids=ids,
-            req_id_to_index={id_: i for i, id_ in enumerate(ids)},
-            sampled_token_ids=sampled_token_ids,
-            spec_token_ids=None,
-            prompt_logprobs_dict={id_: None for id_ in ids},
-            logprobs=None,
-        )
-
-        return output
-    
     def run_decode_loop(self, encoder_hidden_states: torch.Tensor, scheduler_output: SchedulerOutput):
         
         predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output)
