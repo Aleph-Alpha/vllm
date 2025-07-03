@@ -13,7 +13,7 @@ from vllm.utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
-from vllm.v1.hat.hat_utils import HATBatchInput, safe_list_slice
+from vllm.v1.hat.hat_utils import HATBatchInput, safe_list_slice, BYTES_PER_WORKER_STEP, LIMIT_FOR_STATIC_STEPS
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
@@ -87,7 +87,6 @@ class HATWorker(WorkerBase):
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
 
-        self.steps = 0
         self.stream_enc_dec = torch.cuda.Stream()
         self.stream_backbone = torch.cuda.Stream()
 
@@ -240,17 +239,17 @@ class HATWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
 
-        with torch.cuda.stream(self.stream_enc_dec):
-            self.hat_manager.remove_finished_requests(scheduler_output)
-            if not scheduler_output.num_scheduled_tokens:
-                return self._handle_empty_scheduler_output(scheduler_output)
-        
-            scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
-            encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output_byte)
+        self.hat_manager.remove_finished_requests(scheduler_output)
+        if not scheduler_output.num_scheduled_tokens:
+            return self._handle_empty_scheduler_output(scheduler_output)
+    
+        scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
+        encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output_byte)
 
-            encoder_hidden_states_encoder_connector, encoder_hidden_states_enc_dec_loop, encoder_hidden_states_final_decoder, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
-                self.hat_manager.handle_encoder_output(scheduler_output_byte, encoder_hidden_states)
-            )
+        encoder_hidden_states_encoder_connector, encoder_hidden_states_enc_dec_loop, encoder_hidden_states_final_decoder, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
+            self.hat_manager.handle_encoder_output(scheduler_output_byte, encoder_hidden_states)
+        )
+        torch.cuda.synchronize()
 
         with torch.cuda.stream(self.stream_backbone):
             if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
@@ -297,8 +296,11 @@ class HATWorker(WorkerBase):
                                         encoder_hidden_states=encoder_hidden_states)
         model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
-        
-        while self.hat_manager.num_decodes_not_word_boundary > 0:
+
+        process_full_word = self.hat_manager.num_decodes_not_word_boundary <= LIMIT_FOR_STATIC_STEPS
+
+        bytes_processed = 0
+        while self.hat_manager.num_decodes_not_word_boundary > 0 and (bytes_processed < BYTES_PER_WORKER_STEP or process_full_word):
             encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output)
             self.hat_manager.handle_encoder_output_loop(encoder_hidden_states, scheduler_output)
             
@@ -308,6 +310,7 @@ class HATWorker(WorkerBase):
                                             encoder_hidden_states=encoder_hidden_states)
             model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
             scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
+            bytes_processed += 1
     
     def _handle_empty_scheduler_output(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         self.encoder_worker.execute_model(scheduler_output)
