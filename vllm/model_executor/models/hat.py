@@ -99,18 +99,13 @@ class HATAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        is_neox_style = True
-        is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "llama":
-            is_neox_style = False
-        
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
+            is_neox_style=rope_scaling["is_neox_style"] if "is_neox_style" in rope_scaling else True,
         )
 
         self.attn = Attention(
@@ -209,18 +204,13 @@ class HATCrossAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        is_neox_style = True
-        is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "llama":
-            is_neox_style = False
-
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
+            is_neox_style=rope_scaling["is_neox_style"] if "is_neox_style" in rope_scaling else True,
         )
 
     def forward(
