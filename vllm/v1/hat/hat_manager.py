@@ -277,7 +277,7 @@ class HATManager:
                 case HATRequestType.DECODE_WORD_BOUNDARY:
                     assert isinstance(scheduled_req, CachedRequestData)
                     self.req_ids_to_hat_state[req_id].encoder_embeds_new_word.append(
-                        encoder_hidden_states_decodes[decodes, :].unsqueeze(0)
+                        encoder_hidden_states_decodes[decodes:decodes+1, :]
                     )
                     
                     scheduler_output_byte_final_decoder.scheduled_cached_reqs.append(scheduled_req)
@@ -294,9 +294,9 @@ class HATManager:
                     
                     # encoder_embeds_curr_word and curr_word_bytes are now synced
                     self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
-                        encoder_hidden_states_decodes[decodes, :].unsqueeze(0)
+                        encoder_hidden_states_decodes[decodes:decodes+1, :]
                     )
-                    encoder_hidden_states_enc_dec_loop.append(encoder_hidden_states[offset, :].unsqueeze(0))
+                    encoder_hidden_states_enc_dec_loop.append(encoder_hidden_states[offset:offset+1, :])
 
                     scheduler_output_byte_enc_dec.scheduled_cached_reqs.append(scheduled_req)
                     scheduler_output_byte_enc_dec.num_scheduled_tokens[req_id] = 1
@@ -327,7 +327,7 @@ class HATManager:
             req_id = scheduled_req.req_id
             req_state = self.req_ids_to_hat_state[req_id]
             req_state.encoder_embeds_curr_word.append(
-                encoder_hidden_states[idx, :].unsqueeze(0)
+                encoder_hidden_states[idx:idx+1, :]
             )
     
     def prepare_input_encoder_connector(self, encoder_hidden_states_encoder_connector: List[torch.Tensor],
@@ -420,7 +420,7 @@ class HATManager:
                         predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset:offset+num_words_excl_last_word, :])
                         
                         offset += num_words_excl_last_word
-                        req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
+                        req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1:offset, :].clone()
                     
                     
                 case HATRequestType.PREFILL:
@@ -431,11 +431,11 @@ class HATManager:
                         predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset:offset+num_words_excl_last_word, :])
                     
                         offset += num_words_excl_last_word
-                        req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1, :].clone().unsqueeze(0)
+                        req_state.prev_pred_backbone_embedding = predictive_word_embeddings[offset-1:offset, :].clone()
                     
                 case HATRequestType.DECODE_WORD_BOUNDARY:
-                    req_state.prev_pred_backbone_embedding = predictive_word_embeddings_decodes[num_decodes, :].unsqueeze(0)
-                    predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset, :].unsqueeze(0))
+                    req_state.prev_pred_backbone_embedding = predictive_word_embeddings_decodes[num_decodes:num_decodes+1, :]
+                    predictive_word_embeddings_final_decoder.append(predictive_word_embeddings[offset:offset+1, :])
                     num_decodes += 1
                     offset += 1
                     
