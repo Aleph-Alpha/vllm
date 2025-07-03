@@ -348,10 +348,10 @@ class FlashAttentionMetadataBuilder(
         #    n = scheduler_metadata.shape[0]
         #    self.scheduler_metadata[:n].copy_(scheduler_metadata,
         #                                      non_blocking=True)
-        #    # NOTE(woosuk): We should zero out the rest of the scheduler
-        #    # metadata to guarantee the correctness. Otherwise, some thread
-        #    # blocks may use the invalid scheduler metadata and overwrite the
-        #    # output buffer.
+            # NOTE(woosuk): We should zero out the rest of the scheduler
+            # metadata to guarantee the correctness. Otherwise, some thread
+            # blocks may use the invalid scheduler metadata and overwrite the
+            # output buffer.
         #    self.scheduler_metadata[n:] = 0
         #    scheduler_metadata = self.scheduler_metadata[:n]
 

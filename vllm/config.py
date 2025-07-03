@@ -4404,7 +4404,6 @@ class CompilationConfig:
             self.splitting_ops = [] if self.full_cuda_graph else [
                 "vllm.unified_attention",
                 "vllm.unified_attention_with_output",
-                "vllm.run_cross_attn",
             ]
 
 
@@ -4677,7 +4676,8 @@ class VllmConfig:
             # By default, V1 uses piecewise CUDA graphs. If full_cuda_graph
             # is set to True, full CUDA graphs will be used.
             self.compilation_config.cudagraph_num_of_warmups = 1
-            self.compilation_config.level = CompilationLevel.PIECEWISE
+            if not self.model_config.hf_config.model_type == "hierarchical_autoregressive_transformer":
+                self.compilation_config.level = CompilationLevel.PIECEWISE
             self.compilation_config.set_splitting_ops_for_v1()
 
         self._set_cudagraph_sizes()

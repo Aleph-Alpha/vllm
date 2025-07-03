@@ -385,8 +385,8 @@ class HATManager:
         # Assume for now that all decodes finish at a word boundary
         encoder_hidden_states_encoder_connector = torch.cat(encoder_hidden_states_encoder_connector, dim=0)
         word_lens_bytes_per_task_excl_last_word = torch.tensor(list(itertools.chain.from_iterable(word_lens_bytes_per_task_excl_last_word)),
-                                                               dtype=torch.int32,
-                                                               device=self.device)
+                                                               dtype=torch.int32)
+        word_lens_bytes_per_task_excl_last_word = word_lens_bytes_per_task_excl_last_word.to(self.device, non_blocking=True)
         byte_positions = torch.hstack(byte_positions)
         word_positions = torch.hstack(word_positions)
 

@@ -102,7 +102,7 @@ class HATWorker(WorkerBase):
                 ],
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=False))
+                    torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
         
@@ -210,7 +210,7 @@ class HATWorker(WorkerBase):
             ]
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            model_runner._dummy_run(size)
+            model_runner._dummy_run(size, create_input_tensors=True)
         if not self.model_config.enforce_eager:
             model_runner.capture_model()
 
@@ -224,7 +224,7 @@ class HATWorker(WorkerBase):
                                self.scheduler_config.max_num_batched_tokens)
             model_runner._dummy_sampler_run(
                 hidden_states=model_runner._dummy_run(
-                    num_tokens=max_num_reqs))
+                    num_tokens=max_num_reqs, create_input_tensors=True))
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

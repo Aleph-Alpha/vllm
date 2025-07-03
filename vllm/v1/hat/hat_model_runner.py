@@ -74,6 +74,7 @@ class HATModelRunner(GPUModelRunner):
         super().__init__(vllm_config, device)
         self.role: Optional[HATSubmodelRole] = None
 
+        self.use_cuda_graph = not self.model_config.enforce_eager
         # Tensors for CUDA Graph Caching, set in load_model
         self.previous_hidden_states: Optional[torch.Tensor] = None
         self.predictive_word_embeddings: Optional[torch.Tensor] = None
@@ -88,16 +89,16 @@ class HATModelRunner(GPUModelRunner):
 
         match self.role:
             case HATSubmodelRole.DECODER:
-                self.previous_hidden_states = torch.zeros(self.max_num_tokens,
+                self.previous_hidden_states = torch.zeros(self.vllm_config.compilation_config.max_capture_size,
                     self.model_config.hf_config.hidden_size,
                     dtype=self.dtype,
                     device=self.device)
-                self.predictive_word_embeddings = torch.zeros(self.max_num_tokens,
+                self.predictive_word_embeddings = torch.zeros(self.vllm_config.compilation_config.max_capture_size,
                     self.model_config.hf_config.cross_attention_config.hidden_size_kv,
                     dtype=self.dtype,
                     device=self.device)
             case HATSubmodelRole.BACKBONE:
-                self.previous_hidden_states = torch.zeros(self.max_num_tokens,
+                self.previous_hidden_states = torch.zeros(self.vllm_config.compilation_config.max_capture_size,
                     self.model_config.hf_config.hidden_size,
                     dtype=self.dtype,
                     device=self.device)
@@ -440,6 +441,7 @@ class HATModelRunner(GPUModelRunner):
         self,
         num_tokens: int,
         skip_attn: bool = True,
+        create_input_tensors: bool = False,
     ) -> torch.Tensor:
 
         # Padding for DP
@@ -491,7 +493,7 @@ class HATModelRunner(GPUModelRunner):
         with self.maybe_dummy_run_with_lora(self.lora_config,
                                             num_scheduled_tokens):
             model = self.model
-            model_kwargs = self._get_dummy_model_kwargs(num_tokens)
+            model_kwargs = self._get_dummy_model_kwargs(num_tokens, create_tensors=create_input_tensors)
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -520,7 +522,8 @@ class HATModelRunner(GPUModelRunner):
         return outputs[logit_indices]
     
     def profile_run(self) -> None:
-        hidden_states = self._dummy_run(max(1, self.max_num_tokens // COMPRESSION_RATIO) if self.role == HATSubmodelRole.BACKBONE else self.max_num_tokens)
+        hidden_states = self._dummy_run(max(1, self.max_num_tokens // COMPRESSION_RATIO)
+                                        if self.role == HATSubmodelRole.BACKBONE else self.max_num_tokens, create_input_tensors=True)
         if get_pp_group().is_last_rank and self.role == HATSubmodelRole.DECODER:
             sampler_output = self._dummy_sampler_run(hidden_states)
         else:
@@ -580,7 +583,7 @@ class HATModelRunner(GPUModelRunner):
                 attn_metadata[layer_name] = attn_metadata_i
 
         model = self.model
-        model_kwargs = self._get_dummy_model_kwargs(num_tokens)
+        model_kwargs = self._get_dummy_model_kwargs(num_tokens, create_tensors=False)
 
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
@@ -623,9 +626,9 @@ class HATModelRunner(GPUModelRunner):
                 del outputs
                 gc.collect()
             self.graph_memory_pool = graph.pool()
+            self.graphs[num_tokens] = (graph, graph_outputs)
 
         torch.cuda.synchronize()
-        self.graphs[num_tokens] = (graph, graph_outputs)
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         return graph_outputs[logit_indices]
 
@@ -657,7 +660,7 @@ class HATModelRunner(GPUModelRunner):
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
 
-    def _get_dummy_model_kwargs(self, num_input_tokens: int) -> dict[str, Any]:
+    def _get_dummy_model_kwargs(self, num_input_tokens: int, create_tensors: bool = False) -> dict[str, Any]:
         match self.role:
             case HATSubmodelRole.ENCODER:
                 model_kwargs = {
@@ -666,21 +669,38 @@ class HATModelRunner(GPUModelRunner):
                     "positions": self.positions[:num_input_tokens],
                 }
             case HATSubmodelRole.BACKBONE:
+                previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
+                if create_tensors:
+                    previous_hidden_states = torch.zeros(num_input_tokens,
+                                                        self.model_config.hf_config.hidden_size,
+                                                        dtype=self.dtype,
+                                                        device=self.device)
                 model_kwargs = {
                     "input_ids": None,
                     "inputs_embeds": None,
                     "positions": self.positions[:num_input_tokens],
-                    "previous_hidden_states": self.previous_hidden_states[:num_input_tokens, :],
+                    "previous_hidden_states": previous_hidden_states,
                 }
             case HATSubmodelRole.DECODER:
+                previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
+                predictive_word_embeddings = self.predictive_word_embeddings[:num_input_tokens, :]
+                if create_tensors:
+                    previous_hidden_states = torch.zeros(num_input_tokens,
+                                                        self.model_config.hf_config.hidden_size,
+                                                        dtype=self.dtype,
+                                                        device=self.device)
+                    predictive_word_embeddings = torch.zeros(num_input_tokens,
+                                                            self.model_config.hf_config.cross_attention_config.hidden_size_kv,
+                                                            dtype=self.dtype,
+                                                            device=self.device)
                 model_kwargs = {
                     # Reuse input_ids for word positions, because the decoder does not need input_ids
                     "input_ids": None,
                     "inputs_embeds": None,
                     "positions": self.positions[:num_input_tokens],
                     "word_lens_bytes": None,
-                    "predictive_word_embeddings": self.predictive_word_embeddings[:num_input_tokens, :],
-                    "previous_hidden_states": self.previous_hidden_states[:num_input_tokens, :],
+                    "predictive_word_embeddings": predictive_word_embeddings,
+                    "previous_hidden_states": previous_hidden_states,
                 }
         return model_kwargs
 

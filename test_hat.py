@@ -140,7 +140,7 @@ prompts_16 = prompts_128[:16]
 prompts_8 = prompts_128[:8]
 prompts_4 = prompts_128[:4]
 prompts_2 = prompts_128[:2]
-prompts_1 = [prompts_128[1]]
+prompts_1 = [prompts_128[0]]
 # prompts_1 = ["An apple a day", "A cat is a dog and a dog is a cat"]
 #prompts_1 = ["The big horoscope"]
 # prompts_1 = ["Hel"]
@@ -161,19 +161,19 @@ if __name__ == "__main__":
     # llm = LLM(model="/nfs/scratch_2/felix.berkenkamp/70b_converted",
           trust_remote_code=True,
           dtype=torch.bfloat16,
-          enforce_eager=True,
-          compilation_config={"full_cuda_graph": False},
+          enforce_eager=False,
+          compilation_config={"full_cuda_graph": True, "level": 0},
           tensor_parallel_size=1,
           gpu_memory_utilization=0.9,
           block_size=16,
           disable_cascade_attn=True,
-          max_num_batched_tokens=100,
+          max_num_batched_tokens=100000,
           max_model_len=100000, # Can be set to 100k on A100
           max_num_seqs=64)
     
     # llm.start_profile()
-    #outputs = llm.generate([format_llama(p) for p in prompts_1], sampling_params)
-    outputs = llm.generate([p for p in prompts_64], sampling_params)
+    outputs = llm.generate([format_llama(p) for p in prompts_64], sampling_params)
+    #outputs = llm.generate([p for p in prompts_1], sampling_params)
     # llm.stop_profile()
 
     for output in outputs:
