@@ -251,8 +251,8 @@ class HATWorker(WorkerBase):
         )
         torch.cuda.synchronize()
 
-        with torch.cuda.stream(self.stream_backbone):
-            if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
+        if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
+            with torch.cuda.stream(self.stream_backbone):
                 encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
                     self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
                 )
@@ -266,14 +266,14 @@ class HATWorker(WorkerBase):
                 predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output_word, hat_batch_input)
 
                 predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_byte_final_decoder, predictive_word_embeddings)
-                self.hat_manager.update_backbone_info(scheduler_output_word)
+                self.hat_manager.update_backbone_info_prefill_path(scheduler_output_word)
         
-        with torch.cuda.stream(self.stream_enc_dec):
-            if encoder_hidden_states_enc_dec_loop is not None:
+        if encoder_hidden_states_enc_dec_loop is not None:
+            with torch.cuda.stream(self.stream_enc_dec):
                 self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec)
 
-        with torch.cuda.stream(self.stream_backbone):
-            if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0:
+        if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0:
+            with torch.cuda.stream(self.stream_backbone):
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
                 
                 hat_batch_input_final_decoder = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings_final_decoder,
@@ -284,7 +284,7 @@ class HATWorker(WorkerBase):
                 scheduled_cached_reqs_dec_word_boundary = safe_list_slice(scheduler_output_byte_final_decoder.scheduled_cached_reqs,
                                                                         self.hat_manager.num_decodes_word_boundary,
                                                                         keep_prefix=False)
-                self.hat_manager.process_outputs_enc_dec_loop(scheduled_cached_reqs_dec_word_boundary, model_runner_output)
+                self.hat_manager.process_outputs_enc_dec_loop(scheduled_cached_reqs_dec_word_boundary, model_runner_output, decode_path=False)
                 self.hat_manager.process_outputs_prefill_chunked_prefill(scheduler_output_byte_final_decoder, model_runner_output)
 
         return self.hat_manager.finish_step()
@@ -296,11 +296,12 @@ class HATWorker(WorkerBase):
                                         encoder_hidden_states=encoder_hidden_states)
         model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
+        num_decodes_running = len(scheduler_output.scheduled_cached_reqs)
 
-        process_full_word = self.hat_manager.num_decodes_not_word_boundary <= LIMIT_FOR_STATIC_STEPS
+        process_full_word = num_decodes_running <= LIMIT_FOR_STATIC_STEPS
 
         bytes_processed = 0
-        while self.hat_manager.num_decodes_not_word_boundary > 0 and (bytes_processed < BYTES_PER_WORKER_STEP or process_full_word):
+        while num_decodes_running > 0 and (bytes_processed < BYTES_PER_WORKER_STEP or process_full_word):
             encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output)
             self.hat_manager.handle_encoder_output_loop(encoder_hidden_states, scheduler_output)
             
@@ -311,6 +312,22 @@ class HATWorker(WorkerBase):
             model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
             scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
             bytes_processed += 1
+            num_decodes_running = len(scheduler_output.scheduled_cached_reqs)
+            
+        if self.hat_manager.scheduler_output_word_decodes.scheduled_cached_reqs:
+            encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
+                self.hat_manager.prepare_input_encoder_connector([], self.hat_manager.scheduler_output_word_decodes)
+            )
+
+            updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
+                                                                    byte_positions,
+                                                                    word_positions,
+                                                                    word_lens_bytes_per_task_excl_last_word)
+            
+            hat_batch_input = HATBatchInput(latent_word_embeddings=updated_latent_word_embeddings)
+            predictive_word_embeddings = self.backbone_worker.execute_model(self.hat_manager.scheduler_output_word_decodes, hat_batch_input)
+
+            self.hat_manager.update_backbone_info_decode_path(predictive_word_embeddings)
     
     def _handle_empty_scheduler_output(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         self.encoder_worker.execute_model(scheduler_output)

@@ -142,7 +142,7 @@ prompts_4 = prompts_128[:4]
 prompts_2 = prompts_128[:2]
 prompts_1 = [prompts_128[0]]
 # prompts_1 = ["An apple a day", "A cat is a dog and a dog is a cat"]
-#prompts_1 = ["The big horoscope"]
+# prompts_1 = ["The big horoscope"]
 # prompts_1 = ["Hel"]
 # prompts_1 = ["🍎🍎🍎"]
 
@@ -161,7 +161,7 @@ if __name__ == "__main__":
     # llm = LLM(model="/nfs/scratch_2/felix.berkenkamp/70b_converted",
           trust_remote_code=True,
           dtype=torch.bfloat16,
-          enforce_eager=False,
+          enforce_eager=True,
           compilation_config={"full_cuda_graph": True, "level": 0},
           tensor_parallel_size=1,
           gpu_memory_utilization=0.9,
@@ -172,7 +172,7 @@ if __name__ == "__main__":
           max_num_seqs=64)
     
     # llm.start_profile()
-    outputs = llm.generate([format_llama(p) for p in prompts_64], sampling_params)
+    outputs = llm.generate([format_llama(p) for p in prompts_16], sampling_params)
     #outputs = llm.generate([p for p in prompts_1], sampling_params)
     # llm.stop_profile()
 

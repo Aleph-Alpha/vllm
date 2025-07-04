@@ -28,6 +28,7 @@ class HATSequenceState:
     num_scheduled_tokens_byte: int
     len_last_word_chunked: int
     multi_bytes: int
+    block_table_backbone: List[List[int]]
 
     # Predictive word embedding from the previous word (needed by the decoder)
     prev_pred_backbone_embedding: Optional[torch.Tensor] # Shape [word_windwow_size, D]
