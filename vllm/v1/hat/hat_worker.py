@@ -249,7 +249,9 @@ class HATWorker(WorkerBase):
         encoder_hidden_states_encoder_connector, encoder_hidden_states_enc_dec_loop, encoder_hidden_states_final_decoder, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte, encoder_hidden_states)
         )
-        torch.cuda.synchronize()
+
+        self.stream_backbone.wait_stream(self.stream_enc_dec)
+        self.stream_backbone.wait_stream(torch.cuda.default_stream())
 
         if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
             with torch.cuda.stream(self.stream_backbone):
@@ -314,9 +316,10 @@ class HATWorker(WorkerBase):
             bytes_processed += 1
             num_decodes_running = len(scheduler_output.scheduled_cached_reqs)
             
-        if self.hat_manager.scheduler_output_word_decodes.scheduled_cached_reqs:
+        if len(self.hat_manager.scheduler_output_word_decodes.scheduled_cached_reqs) > 0:
+            self.stream_enc_dec.wait_stream(self.stream_backbone)
             encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
-                self.hat_manager.prepare_input_encoder_connector([], self.hat_manager.scheduler_output_word_decodes)
+                self.hat_manager.prepare_input_encoder_connector(None, self.hat_manager.scheduler_output_word_decodes)
             )
 
             updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,

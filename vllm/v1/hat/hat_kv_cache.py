@@ -164,7 +164,8 @@ class HATKVCacheManager:
         if req_id not in self.req_id_to_hat_info:
             self.req_id_to_hat_info[req_id] = HATKVCacheState(num_curr_word_bytes=0, num_computed_tokens_backbone=0, num_computed_tokens_byte=0)
             words = split_text(self.hat_splitter, request._all_token_ids[:num_new_tokens])
-            new_slots_needed_backbone = len(words) - 1
+            # Allocate a slot for the incomplete word here, so we are always one step ahead
+            new_slots_needed_backbone = len(words)
             
             self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[-1])
             self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone = new_slots_needed_backbone
@@ -183,7 +184,6 @@ class HATKVCacheManager:
                 self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone += new_slots_needed_backbone
             else:
                 self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[0])
-                
             self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte += num_new_tokens
         
         num_tokens_backbone = self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone
