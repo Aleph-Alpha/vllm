@@ -200,13 +200,18 @@ class HATManager:
         # Contains encoder hidden states for prefills and chunked_prefills excluding the last word
         # We will later add in the the encoder_embeds for decode sequences that reach the word boundary
         encoder_hidden_states_encoder_connector =[]
-        # Contains encoder hidden state for all decode sequences
-        encoder_hidden_states_enc_dec_loop = []
 
         # Contains encoder hidden states for prefill and chunked_prefills. 
         # Necessary for final decoder forward pass
-        encoder_hidden_states_final_decoder = safe_tensor_slice(encoder_hidden_states,
-                                                                      self.num_decodes_not_word_boundary).clone()
+        encoder_hidden_states_final_decoder = None
+        if self.num_decodes_not_word_boundary != encoder_hidden_states.shape[0]:
+            encoder_hidden_states_final_decoder = safe_tensor_slice(encoder_hidden_states,
+                                                                    self.num_decodes_not_word_boundary).clone()
+        
+        encoder_hidden_states_enc_dec_loop = None
+        if self.num_decodes_not_word_boundary != 0:
+            encoder_hidden_states_enc_dec_loop = safe_tensor_slice(encoder_hidden_states,
+                                                                self.num_decodes_not_word_boundary, keep_prefix=False)
         
         num_decodes = self.num_decodes_not_word_boundary + self.num_decodes_word_boundary
         encoder_hidden_states_decodes = safe_tensor_slice(encoder_hidden_states,
@@ -243,7 +248,7 @@ class HATManager:
                         self.req_ids_to_hat_state[req_id].encoder_embeds_new_word = []
 
                     self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
-                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
+                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :]
                     )
                         
                     offset += word_lens_bytes[-1]
@@ -262,7 +267,7 @@ class HATManager:
                     num_bytes_excl_last_word = sum(word_lens_bytes[:-1])
                     offset += num_bytes_excl_last_word
                     self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
-                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :].clone()
+                        encoder_hidden_states[offset:offset+word_lens_bytes[-1], :]
                     )
 
                     if req_state.num_scheduled_tokens_backbone > 0:
@@ -306,8 +311,6 @@ class HATManager:
                     self.req_ids_to_hat_state[req_id].encoder_embeds_curr_word.append(
                         encoder_hidden_states_decodes[decodes:decodes+1, :]
                     )
-                    encoder_hidden_states_enc_dec_loop.append(encoder_hidden_states[offset:offset+1, :])
-
                     scheduler_output_byte_enc_dec.scheduled_cached_reqs.append(scheduled_req)
                     scheduler_output_byte_enc_dec.num_scheduled_tokens[req_id] = 1
                     scheduler_output_byte_enc_dec.total_num_scheduled_tokens += 1
@@ -317,11 +320,6 @@ class HATManager:
                     offset += 1
                     offset_beginning += 1  
             
-        if len(encoder_hidden_states_enc_dec_loop) > 0:
-            encoder_hidden_states_enc_dec_loop = torch.cat(encoder_hidden_states_enc_dec_loop, dim=0).clone()
-        else:
-            encoder_hidden_states_enc_dec_loop = None
-
         return (
             encoder_hidden_states_encoder_connector, 
             encoder_hidden_states_enc_dec_loop, 
@@ -347,7 +345,7 @@ class HATManager:
         # For chunked prefill, we do need to include curr_word_bytes
         if encoder_hidden_states_encoder_connector is None:
             encoder_hidden_states_encoder_connector = []
-        word_lens_bytes_per_task_excl_last_word = [[0]]
+        word_lens_bytes_per_task_excl_last_word = [0]
         byte_positions = []
         word_positions = []
 
@@ -358,12 +356,13 @@ class HATManager:
             match req_state.request_type:
                 case HATRequestType.CHUNKED_PREFILL:
                     # word_lens_bytes_per_task.append(req_state.word_lens_bytes)
-                    word_lens_bytes_per_task_excl_last_word.append(req_state.word_lens_bytes[:-1])
+                    current_len = len(word_lens_bytes_per_task_excl_last_word)
+                    word_lens_bytes_per_task_excl_last_word.extend(req_state.word_lens_bytes[:-1])
                     
                     # For encoder connector, we need to include the last possibly incomplete word 
                     # the previous worker step for chunked prefills
                     # P WE SHOULD NOT DO THIS FOR FIRST CHUNKED PREFILL
-                    word_lens_bytes_per_task_excl_last_word[-1][0] += req_state.len_last_word_chunked
+                    word_lens_bytes_per_task_excl_last_word[current_len] += req_state.len_last_word_chunked
 
                     num_bytes_last_word = req_state.word_lens_bytes[-1]
                     byte_positions.append(torch.arange(req_state.byte_position - req_state.len_last_word_chunked - req_state.multi_bytes,
@@ -373,12 +372,12 @@ class HATManager:
                     
                 case HATRequestType.PREFILL:
                     num_bytes_last_word = req_state.word_lens_bytes[-1]
-                    word_lens_bytes_per_task_excl_last_word.append(req_state.word_lens_bytes[:-1])
+                    word_lens_bytes_per_task_excl_last_word.extend(req_state.word_lens_bytes[:-1])
                     byte_positions.append(torch.arange(0, req_state.num_scheduled_tokens_byte - num_bytes_last_word))
                     word_positions.append(torch.arange(0, scheduler_output_word.num_scheduled_tokens[req_id]))
                     
                 case HATRequestType.DECODE_WORD_BOUNDARY:
-                    word_lens_bytes_per_task_excl_last_word.append([len(req_state.curr_word_bytes)])
+                    word_lens_bytes_per_task_excl_last_word.append(len(req_state.curr_word_bytes))
                     byte_positions.append(torch.arange(req_state.byte_position - len(req_state.curr_word_bytes),
                                                     req_state.byte_position))
                     word_positions.append(req_state.word_position_cpu)
@@ -390,8 +389,7 @@ class HATManager:
 
         # Assume for now that all decodes finish at a word boundary
         encoder_hidden_states_encoder_connector = torch.cat(encoder_hidden_states_encoder_connector, dim=0)
-        word_lens_bytes_per_task_excl_last_word = torch.tensor(list(itertools.chain.from_iterable(word_lens_bytes_per_task_excl_last_word)),
-                                                               dtype=torch.int32)
+        word_lens_bytes_per_task_excl_last_word = torch.as_tensor(word_lens_bytes_per_task_excl_last_word, dtype=torch.int32).pin_memory()
         word_lens_bytes_per_task_excl_last_word = word_lens_bytes_per_task_excl_last_word.to(self.device, non_blocking=True)
         byte_positions = torch.hstack(byte_positions).to(self.device, non_blocking=True)
         word_positions = torch.hstack(word_positions).to(self.device, non_blocking=True)
@@ -455,10 +453,9 @@ class HATManager:
         for scheduled_req in scheduler_output_byte_final_decoder.scheduled_new_reqs + scheduler_output_byte_final_decoder.scheduled_cached_reqs:
             req_id = scheduled_req.req_id
             req_state = self.req_ids_to_hat_state[req_id]
-            word_lens_bytes_per_task.append(req_state.word_lens_bytes)
+            word_lens_bytes_per_task.extend(req_state.word_lens_bytes)
             
-        word_lens_bytes_per_task = torch.tensor(list(itertools.chain.from_iterable(word_lens_bytes_per_task)),
-                                                dtype=torch.int32).pin_memory()
+        word_lens_bytes_per_task = torch.as_tensor(word_lens_bytes_per_task, dtype=torch.int32).pin_memory()
         word_lens_bytes_per_task = word_lens_bytes_per_task.to(self.device, non_blocking=True)
         
         return word_lens_bytes_per_task
