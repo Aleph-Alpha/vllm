@@ -73,7 +73,7 @@ class HATModelRunner(GPUModelRunner):
     def __init__( self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.role: Optional[HATSubmodelRole] = None
-
+        
         self.use_cuda_graph = not self.model_config.enforce_eager
         # Tensors for CUDA Graph Caching, set in load_model
         self.previous_hidden_states: Optional[torch.Tensor] = None
@@ -82,6 +82,13 @@ class HATModelRunner(GPUModelRunner):
         self.graphs = {}
         self.graph_memory_pool: Optional[Tuple[
             int, int]] = None  # Set during graph capture.
+        
+        self.attn_metadata_ex = None
+        self.logits_indices_ex = None
+        self.decoder_model_runner: Optional["HATModelRunner"] = None
+        
+    def set_decoder_model_runner(self, decoder_model_runner: "HATModelRunner") -> None:
+        self.decoder_model_runner = decoder_model_runner
     
     def load_model(self) -> None:
         super().load_model()
@@ -254,91 +261,6 @@ class HATModelRunner(GPUModelRunner):
         self.input_batch.refresh_sampling_metadata()
 
     def _update_states2(self, scheduler_output: "SchedulerOutput") -> None:
-        """Update the cached states and the create new input batch with the scheduler
-        output.
-
-        The updated states are used by the `_prepare_inputs` function to create
-        the input GPU tensors for the model.
-
-        The SamplingMetadata is updated and copied to the GPU if there is a
-        new/resumed/paused/finished request in the batch.
-        """
-        # Remove finished requests from the cached states.
-        self.input_batch.req_id_to_index = {}
-        self.input_batch._req_ids = []
-        self.input_batch.greedy_reqs = set()
-        self.input_batch.random_reqs = set()
-        for req_id in scheduler_output.finished_req_ids:
-            self.requests.pop(req_id, None)
-
-        # Add new requests to the cached states.
-        idx = 0
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
-            sampling_params = new_req_data.sampling_params
-            if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
-
-            block_ids = copy.deepcopy(new_req_data.block_ids) if self.role == HATSubmodelRole.DECODER else new_req_data.block_ids
-
-            self.requests[req_id] = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_inputs=new_req_data.mm_inputs,
-                mm_positions=new_req_data.mm_positions,
-                sampling_params=sampling_params,
-                generator=generator,
-                block_ids=block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-            )
-            self.input_batch.block_table.add_row(block_ids, idx)
-            self.input_batch.req_id_to_index[req_id] = idx
-            self.input_batch.req_ids.append(req_id)
-            idx += 1
-
-        # Update the states of the running/resumed requests.
-        for req_data in scheduler_output.scheduled_cached_reqs:
-            req_id = req_data.req_id
-            req_state = self.requests[req_id]
-
-            # Update the cached states.
-            num_computed_tokens = req_data.num_computed_tokens
-            req_state.num_computed_tokens = num_computed_tokens
-            # Add the sampled token(s) from the previous step (if any).
-            # This doesn't include "unverified" tokens like spec decode tokens.
-            num_new_tokens = (num_computed_tokens +
-                              len(req_data.new_token_ids) -
-                              req_state.num_tokens)
-            if num_new_tokens == 1:
-                # Avoid slicing list in most common case.
-                req_state.output_token_ids.append(req_data.new_token_ids[-1])
-            elif num_new_tokens > 0:
-                req_state.output_token_ids.extend(
-                    req_data.new_token_ids[-num_new_tokens:])
-
-            self.input_batch.block_table.add_row(req_state.block_ids, idx)
-            self.input_batch.req_id_to_index[req_id] = idx
-            self.input_batch.req_ids.append(req_id)
-            idx += 1
-
-    def _prepare_inputs2(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> tuple[dict[str, Any], torch.Tensor, Optional[SpecDecodeMetadata]]:
-        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        self.input_batch.req_id_to_index = {}
-        self.input_batch._req_ids = []
-        self.input_batch.greedy_reqs = set()
-        self.input_batch.random_reqs = set()
-
-        idx = 0
-        input_ids = []
-        block_ids = []
         for sched_req in scheduler_output.scheduled_new_reqs:
             block_ids = copy.deepcopy(sched_req.block_ids) if self.role == HATSubmodelRole.DECODER else sched_req.block_ids
             req_id = sched_req.req_id
@@ -361,6 +283,69 @@ class HATModelRunner(GPUModelRunner):
                 output_token_ids=[],
                 lora_request=sched_req.lora_request,
             )
+
+        for sched_req in scheduler_output.scheduled_cached_reqs:
+            state = self.requests[sched_req.req_id]
+            num_new_tokens = scheduler_output.num_scheduled_tokens[sched_req.req_id]
+            state.num_computed_tokens = sched_req.num_computed_tokens
+
+            num_new_tokens = (sched_req.num_computed_tokens +
+                              num_new_tokens -
+                              state.num_tokens)
+            if num_new_tokens == 1:
+                # Avoid slicing list in most common case.
+                state.output_token_ids.append(sched_req.new_token_ids[-1])
+            elif num_new_tokens > 0:
+                state.output_token_ids.extend(
+                    sched_req.new_token_ids[-num_new_tokens:])
+
+            if not sched_req.resumed_from_preemption:
+                # Append the new blocks to the existing block IDs.
+                for i in range(len(self.kv_cache_config.kv_cache_groups)):
+                    state.block_ids[i].extend(sched_req.new_block_ids[i])
+            else:
+                # The request is resumed from preemption.
+                # Replace the existing block IDs with the new ones.
+                block_ids = copy.deepcopy(sched_req.new_block_ids) if self.role == HATSubmodelRole.DECODER else sched_req.new_block_ids
+                state.block_ids = block_ids
+
+    def _prepare_inputs2(
+        self,
+        scheduler_output: "SchedulerOutput",
+        prepare_inputs: bool = True,
+    ) -> tuple[dict[str, Any], torch.Tensor, Optional[SpecDecodeMetadata]]:
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        self.input_batch.req_id_to_index = {}
+        self.input_batch._req_ids = []
+        self.input_batch.greedy_reqs = set()
+        self.input_batch.random_reqs = set()
+
+        idx = 0
+        input_ids = []
+        block_ids = []
+        for sched_req in scheduler_output.scheduled_new_reqs:
+            if self.role != HATSubmodelRole.DECODER:
+                block_ids = copy.deepcopy(sched_req.block_ids) if self.role == HATSubmodelRole.DECODER else sched_req.block_ids
+                req_id = sched_req.req_id
+                sampling_params = sched_req.sampling_params
+                if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+                    generator = torch.Generator(device=self.device)
+                    generator.manual_seed(sampling_params.seed)
+                else:
+                    generator = None
+
+                self.requests[req_id] = CachedRequestState(
+                    req_id=req_id,
+                    prompt_token_ids=sched_req.prompt_token_ids,
+                    mm_inputs=sched_req.mm_inputs,
+                    mm_positions=sched_req.mm_positions,
+                    sampling_params=sched_req.sampling_params,
+                    generator=generator,
+                    block_ids=block_ids,
+                    num_computed_tokens=sched_req.num_computed_tokens,
+                    output_token_ids=[],
+                    lora_request=sched_req.lora_request,
+                )
 
             state = self.requests[sched_req.req_id]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[sched_req.req_id]
@@ -398,27 +383,28 @@ class HATModelRunner(GPUModelRunner):
             else:
                 self.input_batch.temperature_cpu[idx] = sampling_params.temperature
                 self.input_batch.random_reqs.add(sched_req.req_id)
-            state.num_computed_tokens = sched_req.num_computed_tokens
+                
+            if self.role != HATSubmodelRole.DECODER:
+                state.num_computed_tokens = sched_req.num_computed_tokens
+                num_new_tokens = (sched_req.num_computed_tokens +
+                                num_new_tokens -
+                                state.num_tokens)
+                if num_new_tokens == 1:
+                    # Avoid slicing list in most common case.
+                    state.output_token_ids.append(sched_req.new_token_ids[-1])
+                elif num_new_tokens > 0:
+                    state.output_token_ids.extend(
+                        sched_req.new_token_ids[-num_new_tokens:])
 
-            num_new_tokens = (sched_req.num_computed_tokens +
-                              num_new_tokens -
-                              state.num_tokens)
-            if num_new_tokens == 1:
-                # Avoid slicing list in most common case.
-                state.output_token_ids.append(sched_req.new_token_ids[-1])
-            elif num_new_tokens > 0:
-                state.output_token_ids.extend(
-                    sched_req.new_token_ids[-num_new_tokens:])
-
-            if not sched_req.resumed_from_preemption:
-                # Append the new blocks to the existing block IDs.
-                for i in range(len(self.kv_cache_config.kv_cache_groups)):
-                    state.block_ids[i].extend(sched_req.new_block_ids[i])
-            else:
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
-                block_ids = copy.deepcopy(sched_req.new_block_ids) if self.role == HATSubmodelRole.DECODER else sched_req.new_block_ids
-                state.block_ids = block_ids
+                if not sched_req.resumed_from_preemption:
+                    # Append the new blocks to the existing block IDs.
+                    for i in range(len(self.kv_cache_config.kv_cache_groups)):
+                        state.block_ids[i].extend(sched_req.new_block_ids[i])
+                else:
+                    # The request is resumed from preemption.
+                    # Replace the existing block IDs with the new ones.
+                    block_ids = copy.deepcopy(sched_req.new_block_ids) if self.role == HATSubmodelRole.DECODER else sched_req.new_block_ids
+                    state.block_ids = block_ids
 
             self.input_batch._req_ids.append(sched_req.req_id)
             self.input_batch.block_table.add_row(state.block_ids, idx)
@@ -549,6 +535,11 @@ class HATModelRunner(GPUModelRunner):
         # TODO: Support prompt logprobs.
         logits_indices = query_start_loc[1:] - 1
         spec_decode_metadata = None
+        
+        if self.role == HATSubmodelRole.ENCODER:
+            self.decoder_model_runner.attn_metadata_ex = attn_metadata_i
+            self.decoder_model_runner.logits_indices_ex = logits_indices
+            self.decoder_model_runner.requests = self.requests
 
         return attn_metadata, logits_indices, spec_decode_metadata
 
@@ -558,9 +549,8 @@ class HATModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
         hat_batch_input: Optional[HATBatchInput] = None,
+        prepare_inputs: bool = True,
     ) -> Union[ModelRunnerOutput, IntermediateTensors, torch.Tensor]:
-
-        #self._update_states2(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
                 # Return empty ModelRunnerOutput if there's no work to do.
@@ -568,8 +558,12 @@ class HATModelRunner(GPUModelRunner):
 
             return self.kv_connector_no_forward(scheduler_output)
 
-        attn_metadata, logits_indices, _ = (
-            self._prepare_inputs2(scheduler_output))
+        if not prepare_inputs:
+            attn_metadata = self.attn_metadata_ex
+            logits_indices = self.logits_indices_ex
+        else:   
+            attn_metadata, logits_indices, _ = (
+                self._prepare_inputs2(scheduler_output))
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or hat_batch_input.word_lens_bytes is None \

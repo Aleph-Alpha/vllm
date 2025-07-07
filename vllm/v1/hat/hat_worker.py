@@ -116,6 +116,15 @@ class HATWorker(WorkerBase):
         self.encoder_model_runner = self.encoder_worker.model_runner
         self.decoder_model_runner = self.decoder_worker.model_runner
         self.backbone_model_runner = self.backbone_worker.model_runner
+
+        self.decoder_model_runner.input_batch = self.encoder_model_runner.input_batch
+        self.decoder_model_runner.input_ids = self.encoder_model_runner.input_ids
+        self.decoder_model_runner.positions = self.encoder_model_runner.positions
+        self.decoder_model_runner.seq_lens = self.encoder_model_runner.seq_lens
+        self.decoder_model_runner.slot_mapping = self.encoder_model_runner.slot_mapping
+        self.decoder_model_runner.query_start_loc = self.encoder_model_runner.query_start_loc
+        
+        self.encoder_model_runner.set_decoder_model_runner(self.decoder_model_runner)
     
     def load_model(self) -> None:
         pass
@@ -270,9 +279,12 @@ class HATWorker(WorkerBase):
                 predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_byte_final_decoder, predictive_word_embeddings)
                 self.hat_manager.update_backbone_info_prefill_path(scheduler_output_word)
         
+        both_paths_active = encoder_hidden_states_enc_dec_loop is not None and (len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0)
+        # both_paths_active = True
+        
         if encoder_hidden_states_enc_dec_loop is not None:
             with torch.cuda.stream(self.stream_enc_dec):
-                self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec)
+                self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec, prepare_inputs=True)
 
         if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0:
             with torch.cuda.stream(self.stream_backbone):
@@ -281,22 +293,39 @@ class HATWorker(WorkerBase):
                 hat_batch_input_final_decoder = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings_final_decoder,
                                                             encoder_hidden_states=encoder_hidden_states_final_decoder,
                                                             word_lens_bytes=word_lens_bytes)
-                model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_final_decoder, hat_batch_input_final_decoder)
+                model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_final_decoder, hat_batch_input_final_decoder, prepare_inputs=both_paths_active)
                 
                 scheduled_cached_reqs_dec_word_boundary = safe_list_slice(scheduler_output_byte_final_decoder.scheduled_cached_reqs,
                                                                         self.hat_manager.num_decodes_word_boundary,
                                                                         keep_prefix=False)
                 self.hat_manager.process_outputs_enc_dec_loop(scheduled_cached_reqs_dec_word_boundary, model_runner_output, decode_path=False)
                 self.hat_manager.process_outputs_prefill_chunked_prefill(scheduler_output_byte_final_decoder, model_runner_output)
+                
+        with torch.cuda.stream(self.stream_enc_dec):
+            if len(self.hat_manager.scheduler_output_word_decodes.scheduled_cached_reqs) > 0:
+                self.stream_enc_dec.wait_stream(self.stream_backbone)
+                encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
+                    self.hat_manager.prepare_input_encoder_connector(None, self.hat_manager.scheduler_output_word_decodes)
+                )
+
+                updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
+                                                                        byte_positions,
+                                                                        word_positions,
+                                                                        word_lens_bytes_per_task_excl_last_word)
+                
+                hat_batch_input = HATBatchInput(latent_word_embeddings=updated_latent_word_embeddings)
+                predictive_word_embeddings = self.backbone_worker.execute_model(self.hat_manager.scheduler_output_word_decodes, hat_batch_input)
+
+                self.hat_manager.update_backbone_info_decode_path(predictive_word_embeddings)
 
         return self.hat_manager.finish_step()
 
-    def run_decode_loop(self, encoder_hidden_states: torch.Tensor, scheduler_output: SchedulerOutput):
+    def run_decode_loop(self, encoder_hidden_states: torch.Tensor, scheduler_output: SchedulerOutput, prepare_inputs: bool = True):
         
         predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output)
         hat_batch_input = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings,
                                         encoder_hidden_states=encoder_hidden_states)
-        model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
+        model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input, prepare_inputs=prepare_inputs)
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
         num_decodes_running = len(scheduler_output.scheduled_cached_reqs)
 
@@ -311,26 +340,10 @@ class HATWorker(WorkerBase):
             
             hat_batch_input = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings,
                                             encoder_hidden_states=encoder_hidden_states)
-            model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input)
+            model_runner_output = self.decoder_worker.execute_model(scheduler_output, hat_batch_input, prepare_inputs=False)
             scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(scheduler_output.scheduled_cached_reqs, model_runner_output)
             bytes_processed += 1
             num_decodes_running = len(scheduler_output.scheduled_cached_reqs)
-            
-        if len(self.hat_manager.scheduler_output_word_decodes.scheduled_cached_reqs) > 0:
-            self.stream_enc_dec.wait_stream(self.stream_backbone)
-            encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
-                self.hat_manager.prepare_input_encoder_connector(None, self.hat_manager.scheduler_output_word_decodes)
-            )
-
-            updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
-                                                                    byte_positions,
-                                                                    word_positions,
-                                                                    word_lens_bytes_per_task_excl_last_word)
-            
-            hat_batch_input = HATBatchInput(latent_word_embeddings=updated_latent_word_embeddings)
-            predictive_word_embeddings = self.backbone_worker.execute_model(self.hat_manager.scheduler_output_word_decodes, hat_batch_input)
-
-            self.hat_manager.update_backbone_info_decode_path(predictive_word_embeddings)
     
     def _handle_empty_scheduler_output(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         self.encoder_worker.execute_model(scheduler_output)
@@ -374,6 +387,7 @@ class HATModelWorker(Worker):
         self,
         scheduler_output: "SchedulerOutput",
         hat_batch_input: Optional[HATBatchInput] = None,
+        prepare_inputs: bool = True,
     ) -> Optional[ModelRunnerOutput]:
         intermediate_tensors = None
         if not get_pp_group().is_first_rank:
@@ -383,7 +397,8 @@ class HATModelWorker(Worker):
 
         output = self.model_runner.execute_model(scheduler_output,
                                                  intermediate_tensors,
-                                                 hat_batch_input)
+                                                 hat_batch_input,
+                                                 prepare_inputs)
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.distributed_executor_backend != "external_launcher" \
             and not get_pp_group().is_last_rank:
