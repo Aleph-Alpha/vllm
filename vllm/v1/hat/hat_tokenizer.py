@@ -120,6 +120,9 @@ class HATTokenizer(TokenizerBase):
                text: str,
                add_special_tokens: Optional[bool] = None) -> List[int]:
         return self.hat_splitter.encode_to_flattened(text)
+    
+    def encode_to_words(self, text: str) -> List[List[int]]:
+        return self.hat_splitter.encode(text)
 
     def apply_chat_template(self,
                             conversation,
