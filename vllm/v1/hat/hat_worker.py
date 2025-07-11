@@ -76,8 +76,8 @@ class HATWorker(WorkerBase):
                  decoder_worker: WorkerBase,
                  backbone_worker: WorkerBase,
                  vllm_config: VllmConfig):
-        self.encoder_worker = SmallerTpWorker(encoder_worker, [0])
-        self.decoder_worker = SmallerTpWorker(decoder_worker, [0])
+        self.encoder_worker = SmallerTpWorker(encoder_worker)
+        self.decoder_worker = SmallerTpWorker(decoder_worker)
         self.backbone_worker = backbone_worker
         
         self.encoder_connector = None
@@ -127,6 +127,7 @@ class HATWorker(WorkerBase):
         self.decoder_model_runner.query_start_loc = self.encoder_model_runner.query_start_loc
         
         self.encoder_model_runner.set_decoder_model_runner(self.decoder_model_runner)
+        self.default_stream = torch.cuda.default_stream()
         self.stream_backbone = torch.cuda.Stream()
         self.stream_enc_dec = torch.cuda.Stream()
 
@@ -231,10 +232,11 @@ class HATWorker(WorkerBase):
             self.hat_manager.handle_encoder_output(scheduler_output_byte, encoder_hidden_states)
         )
 
+        self.stream_backbone.wait_stream(self.default_stream)
+        self.stream_enc_dec.wait_stream(self.stream_backbone)
         self.stream_backbone.wait_stream(self.stream_enc_dec)
-        self.stream_backbone.wait_stream(torch.cuda.default_stream())
 
-        if len(scheduler_output_word.scheduled_new_reqs) > 0 or len(scheduler_output_word.scheduled_cached_reqs) > 0:
+        if self._has_scheduled_requests(scheduler_output_word):
             with torch.cuda.stream(self.stream_backbone):
                 encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
                     self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
@@ -251,14 +253,12 @@ class HATWorker(WorkerBase):
                 predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_byte_final_decoder, predictive_word_embeddings)
                 self.hat_manager.update_backbone_info_prefill_path(scheduler_output_word)
         
-        both_paths_active = encoder_hidden_states_enc_dec_loop is not None and (len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0)
-        
+        both_paths_active = encoder_hidden_states_enc_dec_loop is not None and self._has_scheduled_requests(scheduler_output_byte_final_decoder)
         if encoder_hidden_states_enc_dec_loop is not None:
             with torch.cuda.stream(self.stream_enc_dec):
                 self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec, prepare_inputs=True)
 
-        torch.cuda.synchronize()
-        if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0:
+        if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
             with torch.cuda.stream(self.stream_backbone):
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
                 
@@ -272,9 +272,9 @@ class HATWorker(WorkerBase):
                                                                         keep_prefix=False)
                 self.hat_manager.process_outputs_enc_dec_loop(scheduled_cached_reqs_dec_word_boundary, model_runner_output, decode_path=False)
                 self.hat_manager.process_outputs_prefill_chunked_prefill(scheduler_output_byte_final_decoder, model_runner_output)
-                
-        with torch.cuda.stream(self.stream_enc_dec):
-            if len(self.hat_manager.scheduler_output_word_decodes.scheduled_cached_reqs) > 0:
+             
+        if self._has_scheduled_requests(self.hat_manager.scheduler_output_word_decodes):   
+            with torch.cuda.stream(self.stream_enc_dec):
                 self.stream_enc_dec.wait_stream(self.stream_backbone)
                 encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
                     self.hat_manager.prepare_input_encoder_connector(None, self.hat_manager.scheduler_output_word_decodes)
@@ -294,8 +294,6 @@ class HATWorker(WorkerBase):
             #exit()
             pass
         self.steps += 1
-        if self.rank == 0:
-            print("finished step")
         return self.hat_manager.finish_step()
 
     def run_decode_loop(self, encoder_hidden_states: torch.Tensor, scheduler_output: SchedulerOutput, prepare_inputs: bool = True):
@@ -333,6 +331,9 @@ class HATWorker(WorkerBase):
         self.hat_manager.first_word_embedding = (
             self.backbone_worker.get_model().decoder_connector.first_word_embedding.squeeze(0)
         )
+
+    def _has_scheduled_requests(self, scheduler_output: SchedulerOutput) -> bool:
+        return bool(scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs)
 
     @property
     def rank(self):
@@ -418,32 +419,24 @@ class HATModelWorker(Worker):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
         
-            
 
 class SmallerTpWorker:
-    """Class which allows a speculative draft model to run with smaller tensor
-    parallel degree than target model.
-    This reduces the communication overhead of small draft models.
-
-    To implement this feature, this class differs behavior based on is_dummy
-    flag, where dummy means worker that does not participate draft generation.
-    Participating workers use a smaller tp group by patching vLLM's tensor
-    parallel group temporarily during forward passes of draft models.
+    """Class which allows us to run the smaller byte models replicated across
+    the TP ranks.
     """
 
-    def __init__(self, worker: HATModelWorker, draft_ranks: List[int]):
-        """Create a SmallerTpProposerWorker.
-
-        Args:
-            worker (~vllm.spec_decode.multi_step_worker.MultiStepWorker): an
-            actual worker wrapped with this class
-            draft_ranks (List[int]): if this value is given, only the GPU ranks
-            written in this value participate in draft generation
-        """
+    def __init__(self, worker: HATModelWorker):
         self._worker = worker
-        self._draft_ranks = draft_ranks
-
         self._tp_group = None
+        self._patched_methods = [
+            "load_model",
+            "determine_available_memory",
+            "get_kv_cache_spec",
+            "initialize_from_config",
+            "compile_or_warm_up_model",
+            "get_model",
+            "execute_model",
+        ]
 
     def _patch_tensor_parallel_group(self):
         """Temporarily patch the global tp group state with its own tp group
@@ -461,50 +454,14 @@ class SmallerTpWorker:
         with self._patch_tensor_parallel_group():
             self._worker.init_device()
 
-    def load_model(self) -> None:
-        with self._patch_tensor_parallel_group():
-            self._worker.load_model()
-
-    def determine_available_memory(self) -> Tuple[int, int]:
-        with self._patch_tensor_parallel_group():
-            return self._worker.determine_available_memory()
-
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        with self._patch_tensor_parallel_group():
-            return self._worker.get_kv_cache_spec()
-
-    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        with self._patch_tensor_parallel_group():
-            self._worker.initialize_from_config(kv_cache_config)
-
-    def compile_or_warm_up_model(self, run_sampler: bool = False) -> None:
-        with self._patch_tensor_parallel_group():
-            self._worker.compile_or_warm_up_model(run_sampler)
-
-    def get_model(self) -> nn.Module:
-        with self._patch_tensor_parallel_group():
-            return self._worker.get_model()
-
-    def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-        hat_batch_input: Optional[HATBatchInput] = None,
-        prepare_inputs: bool = True,
-    ) -> Optional[ModelRunnerOutput]:
-        with self._patch_tensor_parallel_group():
-            return self._worker.execute_model(scheduler_output, hat_batch_input, prepare_inputs)
-
-    @property
-    def rank(self):
-        return self._worker.rank
-
-    @property
-    def device(self):
-        return self._worker.device
-    
-    @property
-    def model_runner(self):
-        return self._worker.model_runner
+    def __getattr__(self, name):
+        attr = getattr(self._worker, name)
+        if name in self._patched_methods and callable(attr):
+            def wrapped(*args, **kwargs):
+                with self._patch_tensor_parallel_group():
+                    return attr(*args, **kwargs)
+            return wrapped
+        return attr
 
 
 def _allocate_kv_cache_tensors(
@@ -591,4 +548,3 @@ def _reshape_kv_cache_tensors(
                 raise NotImplementedError
     return kv_caches
     
-        
