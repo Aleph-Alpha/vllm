@@ -1,11 +1,12 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, init_model_parallel_group, get_tp_group, patch_tensor_parallel_group
 from vllm.logger import init_logger
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.utils import set_random_seed
@@ -58,6 +59,9 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args, **kwar
 
     if worker_config.model_config.hf_config.sliding_window is None:
         worker_config.cache_config.sliding_window = None
+    if architecture != "HATBackboneForCausalLM":
+        worker_config.parallel_config.tensor_parallel_size = 1
+        worker_config.parallel_config.world_size = 1
 
     kwargs["vllm_config"] = worker_config
     kwargs["model_runner_cls"] = HATModelRunner
@@ -72,8 +76,8 @@ class HATWorker(WorkerBase):
                  decoder_worker: WorkerBase,
                  backbone_worker: WorkerBase,
                  vllm_config: VllmConfig):
-        self.encoder_worker = encoder_worker
-        self.decoder_worker = decoder_worker
+        self.encoder_worker = SmallerTpWorker(encoder_worker, [0])
+        self.decoder_worker = SmallerTpWorker(decoder_worker, [0])
         self.backbone_worker = backbone_worker
         
         self.encoder_connector = None
@@ -86,9 +90,7 @@ class HATWorker(WorkerBase):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
-
-        self.stream_enc_dec = torch.cuda.Stream()
-        self.stream_backbone = torch.cuda.Stream()
+        self.steps = 0
 
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
@@ -106,12 +108,12 @@ class HATWorker(WorkerBase):
             self.profiler = None
         
     def init_device(self) -> None:
+        self.backbone_worker.init_device()
+        self.backbone_worker.load_model()
         self.encoder_worker.init_device()
         self.encoder_worker.load_model()
         self.decoder_worker.init_device()
         self.decoder_worker.load_model()
-        self.backbone_worker.init_device()
-        self.backbone_worker.load_model()
         
         self.encoder_model_runner = self.encoder_worker.model_runner
         self.decoder_model_runner = self.decoder_worker.model_runner
@@ -125,6 +127,9 @@ class HATWorker(WorkerBase):
         self.decoder_model_runner.query_start_loc = self.encoder_model_runner.query_start_loc
         
         self.encoder_model_runner.set_decoder_model_runner(self.decoder_model_runner)
+        self.stream_backbone = torch.cuda.Stream()
+        self.stream_enc_dec = torch.cuda.Stream()
+
     
     def load_model(self) -> None:
         pass
@@ -205,49 +210,16 @@ class HATWorker(WorkerBase):
                                       driver_rank=self.driver_rank)
         self._setup_modules()
         
-    def _compile_or_warm_up_model(self, model_runner, run_sampler: bool = False) -> None:
-        # warm up sizes that are not in cudagraph capture sizes,
-        # but users still want to compile for better performance,
-        # e.g. for the max-num-batched token size in chunked prefill.
-        warmup_sizes = model_runner.vllm_config.compilation_config.compile_sizes.copy()
-        if not self.model_config.enforce_eager:
-            warmup_sizes = [
-                x for x in warmup_sizes if x not in
-                self.vllm_config.compilation_config.cudagraph_capture_sizes
-            ]
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            model_runner._dummy_run(size, create_input_tensors=True)
-        if not self.model_config.enforce_eager:
-            model_runner.capture_model()
-
-        # Warm up sampler and preallocate memory buffer for logits and other
-        # sampling related tensors of max possible shape to avoid memory
-        # fragmentation issue.
-        # NOTE: This is called after `capture_model` on purpose to prevent
-        # memory buffers from being cleared by `torch.cuda.empty_cache`.
-        if get_pp_group().is_last_rank and run_sampler:
-            max_num_reqs = min(self.scheduler_config.max_num_seqs,
-                               self.scheduler_config.max_num_batched_tokens)
-            model_runner._dummy_sampler_run(
-                hidden_states=model_runner._dummy_run(
-                    num_tokens=max_num_reqs, create_input_tensors=True))
-
-        # Reset the seed to ensure that the random state is not affected by
-        # the model initialization and profiling.
-        set_random_seed(self.model_config.seed)
-        
     def compile_or_warm_up_model(self) -> None:
-        self._compile_or_warm_up_model(self.backbone_model_runner)
-        self._compile_or_warm_up_model(self.encoder_model_runner)
-        self._compile_or_warm_up_model(self.decoder_model_runner, True)    
+        self.encoder_worker.compile_or_warm_up_model()
+        self.backbone_worker.compile_or_warm_up_model()
+        self.decoder_worker.compile_or_warm_up_model(True)    
 
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-
         self.hat_manager.remove_finished_requests(scheduler_output)
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
@@ -280,12 +252,12 @@ class HATWorker(WorkerBase):
                 self.hat_manager.update_backbone_info_prefill_path(scheduler_output_word)
         
         both_paths_active = encoder_hidden_states_enc_dec_loop is not None and (len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0)
-        # both_paths_active = True
         
         if encoder_hidden_states_enc_dec_loop is not None:
             with torch.cuda.stream(self.stream_enc_dec):
                 self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec, prepare_inputs=True)
 
+        torch.cuda.synchronize()
         if len(scheduler_output_byte_final_decoder.scheduled_new_reqs) > 0 or len(scheduler_output_byte_final_decoder.scheduled_cached_reqs) > 0:
             with torch.cuda.stream(self.stream_backbone):
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
@@ -318,10 +290,15 @@ class HATWorker(WorkerBase):
 
                 self.hat_manager.update_backbone_info_decode_path(predictive_word_embeddings)
 
+        if self.steps == 3:
+            #exit()
+            pass
+        self.steps += 1
+        if self.rank == 0:
+            print("finished step")
         return self.hat_manager.finish_step()
 
     def run_decode_loop(self, encoder_hidden_states: torch.Tensor, scheduler_output: SchedulerOutput, prepare_inputs: bool = True):
-        
         predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output)
         hat_batch_input = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings,
                                         encoder_hidden_states=encoder_hidden_states)
@@ -359,11 +336,11 @@ class HATWorker(WorkerBase):
 
     @property
     def rank(self):
-        return self.encoder_worker.rank
+        return self.backbone_worker.rank
 
     @property
     def device(self):
-        return self.encoder_worker.device
+        return self.backbone_worker.device
 
     @property
     def driver_rank(self) -> int:
@@ -408,8 +385,128 @@ class HATModelWorker(Worker):
             return None
 
         return output
-            
+
+    def compile_or_warm_up_model(self, run_sampler: bool = False) -> None:
+        # warm up sizes that are not in cudagraph capture sizes,
+        # but users still want to compile for better performance,
+        # e.g. for the max-num-batched token size in chunked prefill.
+        warmup_sizes = self.model_runner.vllm_config.compilation_config.compile_sizes.copy()
+        if not self.model_config.enforce_eager:
+            warmup_sizes = [
+                x for x in warmup_sizes if x not in
+                self.vllm_config.compilation_config.cudagraph_capture_sizes
+            ]
+        for size in sorted(warmup_sizes, reverse=True):
+            logger.info("Compile and warming up model for size %d", size)
+            self.model_runner._dummy_run(size, create_input_tensors=True)
+        if not self.model_config.enforce_eager:
+            self.model_runner.capture_model()
+
+        # Warm up sampler and preallocate memory buffer for logits and other
+        # sampling related tensors of max possible shape to avoid memory
+        # fragmentation issue.
+        # NOTE: This is called after `capture_model` on purpose to prevent
+        # memory buffers from being cleared by `torch.cuda.empty_cache`.
+        if get_pp_group().is_last_rank and run_sampler:
+            max_num_reqs = min(self.scheduler_config.max_num_seqs,
+                               self.scheduler_config.max_num_batched_tokens)
+            self.model_runner._dummy_sampler_run(
+                hidden_states=self.model_runner._dummy_run(
+                    num_tokens=max_num_reqs, create_input_tensors=True))
+
+        # Reset the seed to ensure that the random state is not affected by
+        # the model initialization and profiling.
+        set_random_seed(self.model_config.seed)
         
+            
+
+class SmallerTpWorker:
+    """Class which allows a speculative draft model to run with smaller tensor
+    parallel degree than target model.
+    This reduces the communication overhead of small draft models.
+
+    To implement this feature, this class differs behavior based on is_dummy
+    flag, where dummy means worker that does not participate draft generation.
+    Participating workers use a smaller tp group by patching vLLM's tensor
+    parallel group temporarily during forward passes of draft models.
+    """
+
+    def __init__(self, worker: HATModelWorker, draft_ranks: List[int]):
+        """Create a SmallerTpProposerWorker.
+
+        Args:
+            worker (~vllm.spec_decode.multi_step_worker.MultiStepWorker): an
+            actual worker wrapped with this class
+            draft_ranks (List[int]): if this value is given, only the GPU ranks
+            written in this value participate in draft generation
+        """
+        self._worker = worker
+        self._draft_ranks = draft_ranks
+
+        self._tp_group = None
+
+    def _patch_tensor_parallel_group(self):
+        """Temporarily patch the global tp group state with its own tp group
+        state.
+        """
+        return patch_tensor_parallel_group(self._tp_group)
+
+    def init_device(self) -> None:
+        # creates tp process group containing only a subset of gpu ranks
+        local_rank = get_tp_group().local_rank
+        tp_backend = torch.distributed.get_backend(get_tp_group().device_group)
+        self._tp_group = init_model_parallel_group([[local_rank]],
+                                                   local_rank, tp_backend)
+
+        with self._patch_tensor_parallel_group():
+            self._worker.init_device()
+
+    def load_model(self) -> None:
+        with self._patch_tensor_parallel_group():
+            self._worker.load_model()
+
+    def determine_available_memory(self) -> Tuple[int, int]:
+        with self._patch_tensor_parallel_group():
+            return self._worker.determine_available_memory()
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        with self._patch_tensor_parallel_group():
+            return self._worker.get_kv_cache_spec()
+
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        with self._patch_tensor_parallel_group():
+            self._worker.initialize_from_config(kv_cache_config)
+
+    def compile_or_warm_up_model(self, run_sampler: bool = False) -> None:
+        with self._patch_tensor_parallel_group():
+            self._worker.compile_or_warm_up_model(run_sampler)
+
+    def get_model(self) -> nn.Module:
+        with self._patch_tensor_parallel_group():
+            return self._worker.get_model()
+
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hat_batch_input: Optional[HATBatchInput] = None,
+        prepare_inputs: bool = True,
+    ) -> Optional[ModelRunnerOutput]:
+        with self._patch_tensor_parallel_group():
+            return self._worker.execute_model(scheduler_output, hat_batch_input, prepare_inputs)
+
+    @property
+    def rank(self):
+        return self._worker.rank
+
+    @property
+    def device(self):
+        return self._worker.device
+    
+    @property
+    def model_runner(self):
+        return self._worker.model_runner
+
+
 def _allocate_kv_cache_tensors(
         kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
     """
