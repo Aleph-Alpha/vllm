@@ -1,9 +1,8 @@
 from typing import List, Optional, Tuple
-
+import dataclasses
 import torch
 import torch.nn as nn
 import vllm.envs as envs
-from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed.parallel_state import get_pp_group, init_model_parallel_group, get_tp_group, patch_tensor_parallel_group
@@ -14,7 +13,7 @@ from vllm.utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
-from vllm.v1.hat.hat_utils import HATBatchInput, safe_list_slice, BYTES_PER_WORKER_STEP, LIMIT_FOR_STATIC_STEPS
+from vllm.v1.hat.hat_utils import HATBatchInput, safe_list_slice, _allocate_kv_cache_tensors, _reshape_kv_cache_tensors, BYTES_PER_WORKER_STEP, LIMIT_FOR_STATIC_STEPS
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
@@ -72,25 +71,15 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args, **kwar
 
 class HATWorker(WorkerBase):
 
-    def __init__(self, encoder_worker: WorkerBase,
-                 decoder_worker: WorkerBase,
-                 backbone_worker: WorkerBase,
-                 vllm_config: VllmConfig):
-        self.encoder_worker = SmallerTpWorker(encoder_worker)
-        self.decoder_worker = SmallerTpWorker(decoder_worker)
+    def __init__(self, encoder_worker: WorkerBase, decoder_worker: WorkerBase, backbone_worker: WorkerBase, vllm_config: VllmConfig):
+        self.encoder_worker = SmallerTpWorker(encoder_worker) if vllm_config.parallel_config.tensor_parallel_size > 1 else encoder_worker
+        self.decoder_worker = SmallerTpWorker(decoder_worker) if vllm_config.parallel_config.tensor_parallel_size > 1 else decoder_worker
         self.backbone_worker = backbone_worker
         
         self.encoder_connector = None
-        self.use_cuda_graph = vllm_config.compilation_config.max_capture_size > 0
         self.hat_manager = None
-        self.pred_word_embeds_buffer = None
-        self.backbone_num_gpu_blocks: Optional[int] = None
-        self.process_full_word = False
         
         self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.scheduler_config = vllm_config.scheduler_config
-        self.steps = 0
 
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
@@ -119,14 +108,16 @@ class HATWorker(WorkerBase):
         self.decoder_model_runner = self.decoder_worker.model_runner
         self.backbone_model_runner = self.backbone_worker.model_runner
 
+        # L TODO: This is a hack to get the decoder to use the same input batch as the encoder. Refactor this by putting both
+        # into the same model runner.
         self.decoder_model_runner.input_batch = self.encoder_model_runner.input_batch
         self.decoder_model_runner.input_ids = self.encoder_model_runner.input_ids
         self.decoder_model_runner.positions = self.encoder_model_runner.positions
         self.decoder_model_runner.seq_lens = self.encoder_model_runner.seq_lens
         self.decoder_model_runner.slot_mapping = self.encoder_model_runner.slot_mapping
         self.decoder_model_runner.query_start_loc = self.encoder_model_runner.query_start_loc
-        
         self.encoder_model_runner.set_decoder_model_runner(self.decoder_model_runner)
+
         self.default_stream = torch.cuda.default_stream()
         self.stream_backbone = torch.cuda.Stream()
         self.stream_enc_dec = torch.cuda.Stream()
@@ -228,42 +219,30 @@ class HATWorker(WorkerBase):
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(scheduler_output)
         encoder_hidden_states = self.encoder_worker.execute_model(scheduler_output_byte)
 
-        encoder_hidden_states_encoder_connector, encoder_hidden_states_enc_dec_loop, encoder_hidden_states_final_decoder, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
+        encoder_hidden_states_phases, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte, encoder_hidden_states)
         )
 
-        self.stream_backbone.wait_stream(self.default_stream)
-        self.stream_enc_dec.wait_stream(self.stream_backbone)
-        self.stream_backbone.wait_stream(self.stream_enc_dec)
-
         if self._has_scheduled_requests(scheduler_output_word):
+            self.stream_backbone.wait_stream(self.default_stream)
+            self.stream_backbone.wait_stream(self.stream_enc_dec)
             with torch.cuda.stream(self.stream_backbone):
-                encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
-                    self.hat_manager.prepare_input_encoder_connector(encoder_hidden_states_encoder_connector, scheduler_output_word)
-                )
-
-                updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
-                                                                        byte_positions,
-                                                                        word_positions,
-                                                                        word_lens_bytes_per_task_excl_last_word)
-                
-                hat_batch_input = HATBatchInput(latent_word_embeddings=updated_latent_word_embeddings)
-                predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output_word, hat_batch_input)
-
+                predictive_word_embeddings = self.run_backbone(scheduler_output_word, encoder_hidden_states_phases.encoder_hidden_states_encoder_connector)
                 predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(scheduler_output_byte_final_decoder, predictive_word_embeddings)
                 self.hat_manager.update_backbone_info_prefill_path(scheduler_output_word)
         
-        both_paths_active = encoder_hidden_states_enc_dec_loop is not None and self._has_scheduled_requests(scheduler_output_byte_final_decoder)
-        if encoder_hidden_states_enc_dec_loop is not None:
+        both_paths_active = self._has_scheduled_requests(scheduler_output_byte_enc_dec) and self._has_scheduled_requests(scheduler_output_byte_final_decoder)
+        if self._has_scheduled_requests(scheduler_output_byte_enc_dec):
+            self.stream_enc_dec.wait_stream(self.default_stream)
             with torch.cuda.stream(self.stream_enc_dec):
-                self.run_decode_loop(encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec, prepare_inputs=True)
+                self.run_decode_loop(encoder_hidden_states_phases.encoder_hidden_states_enc_dec_loop, scheduler_output_byte_enc_dec, prepare_inputs=True)
 
         if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
             with torch.cuda.stream(self.stream_backbone):
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(scheduler_output_byte_final_decoder)
                 
                 hat_batch_input_final_decoder = HATBatchInput(predictive_word_embeddings=predictive_word_embeddings_final_decoder,
-                                                            encoder_hidden_states=encoder_hidden_states_final_decoder,
+                                                            encoder_hidden_states=encoder_hidden_states_phases.encoder_hidden_states_final_decoder,
                                                             word_lens_bytes=word_lens_bytes)
                 model_runner_output = self.decoder_worker.execute_model(scheduler_output_byte_final_decoder, hat_batch_input_final_decoder, prepare_inputs=both_paths_active)
                 
@@ -273,28 +252,21 @@ class HATWorker(WorkerBase):
                 self.hat_manager.process_outputs_enc_dec_loop(scheduled_cached_reqs_dec_word_boundary, model_runner_output, decode_path=False)
                 self.hat_manager.process_outputs_prefill_chunked_prefill(scheduler_output_byte_final_decoder, model_runner_output)
              
-        if self._has_scheduled_requests(self.hat_manager.scheduler_output_word_decodes):   
+        scheduler_output_word_decodes = self.hat_manager.scheduler_output_word_decodes
+        if self._has_scheduled_requests(scheduler_output_word_decodes):   
+            self.stream_enc_dec.wait_stream(self.stream_backbone)
             with torch.cuda.stream(self.stream_enc_dec):
-                self.stream_enc_dec.wait_stream(self.stream_backbone)
-                encoder_hidden_states_encoder_connector, word_lens_bytes_per_task_excl_last_word, byte_positions, word_positions = (
-                    self.hat_manager.prepare_input_encoder_connector(None, self.hat_manager.scheduler_output_word_decodes)
-                )
-
-                updated_latent_word_embeddings = self.encoder_connector(encoder_hidden_states_encoder_connector,
-                                                                        byte_positions,
-                                                                        word_positions,
-                                                                        word_lens_bytes_per_task_excl_last_word)
-                
-                hat_batch_input = HATBatchInput(latent_word_embeddings=updated_latent_word_embeddings)
-                predictive_word_embeddings = self.backbone_worker.execute_model(self.hat_manager.scheduler_output_word_decodes, hat_batch_input)
-
+                predictive_word_embeddings = self.run_backbone(scheduler_output_word_decodes)
                 self.hat_manager.update_backbone_info_decode_path(predictive_word_embeddings)
 
-        if self.steps == 3:
-            #exit()
-            pass
-        self.steps += 1
         return self.hat_manager.finish_step()
+
+    def run_backbone(self, scheduler_output: SchedulerOutput, encoder_hidden_states: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        encoder_connector_input = self.hat_manager.prepare_input_encoder_connector(scheduler_output, encoder_hidden_states)
+        updated_latent_word_embeddings = self.encoder_connector(**dataclasses.asdict(encoder_connector_input))
+        hat_batch_input = HATBatchInput(latent_word_embeddings=updated_latent_word_embeddings)
+        predictive_word_embeddings = self.backbone_worker.execute_model(scheduler_output, hat_batch_input)
+        return predictive_word_embeddings
 
     def run_decode_loop(self, encoder_hidden_states: torch.Tensor, scheduler_output: SchedulerOutput, prepare_inputs: bool = True):
         predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(scheduler_output)
@@ -462,89 +434,3 @@ class SmallerTpWorker:
                     return attr(*args, **kwargs)
             return wrapped
         return attr
-
-
-def _allocate_kv_cache_tensors(
-        kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
-    """
-    Initializes the KV cache buffer with the correct size. The buffer needs
-    to be reshaped to the desired shape before being used by the models.
-
-    Args:
-        kv_cache_config: The KV cache config 
-    Returns:
-        dict[str, torch.Tensor]: A map between layer names to their 
-        corresponding memory buffer for KV cache.
-        """
-    kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        tensor = torch.zeros(kv_cache_tensor.size,
-                                dtype=torch.int8,
-                                device="cuda")
-        for layer_name in kv_cache_tensor.shared_by:
-            kv_cache_raw_tensors[layer_name] = tensor
-
-    layer_names = set()
-    for group in kv_cache_config.kv_cache_groups:
-        layer_names.update(group.layer_names)
-    assert layer_names == set(kv_cache_raw_tensors.keys(
-    )), "Some layers are not correctly initialized"
-    return kv_cache_raw_tensors
-
-def _reshape_kv_cache_tensors(
-    kv_cache_config: KVCacheConfig,
-    kv_cache_raw_tensors: dict[str, torch.Tensor],
-    attn_backends: List[AttentionBackend],
-) -> dict[str, torch.Tensor]:
-    """
-    Reshape the KV cache tensors to the desired shape and dtype.
-
-    Args:
-        kv_cache_config: The KV cache config 
-        kv_cache_raw_tensors: The KV cache buffer of each layer, with 
-        correct size but uninitialized shape.
-    Returns:
-        Dict[str, torch.Tensor]: A map between layer names to their 
-        corresponding memory buffer for KV cache.
-    """
-    kv_caches: dict[str, torch.Tensor] = {}
-    for i, kv_cache_group_spec in enumerate(
-            kv_cache_config.kv_cache_groups):
-        kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-        for layer_name in kv_cache_group_spec.layer_names:
-            raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = (raw_tensor.numel() //
-                            kv_cache_spec.page_size_bytes)
-            if isinstance(kv_cache_spec, AttentionSpec):
-                kv_cache_shape = attn_backends[i].get_kv_cache_shape(
-                    num_blocks, kv_cache_spec.block_size,
-                    kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
-                dtype = kv_cache_spec.dtype
-                try:
-                    kv_cache_stride_order = attn_backends[
-                        i].get_kv_cache_stride_order()
-                    assert len(kv_cache_stride_order) == len(
-                        kv_cache_shape)
-                except (AttributeError, NotImplementedError):
-                    kv_cache_stride_order = tuple(
-                        range(len(kv_cache_shape)))
-                # The allocation respects the backend-defined stride order
-                # to ensure the semantic remains consistent for each
-                # backend. We first obtain the generic kv cache shape and
-                # then permute it according to the stride order which could
-                # result in a non-contiguous tensor.
-                kv_cache_shape = tuple(kv_cache_shape[i]
-                                        for i in kv_cache_stride_order)
-                # Maintain original KV shape view.
-                inv_order = [
-                    kv_cache_stride_order.index(i)
-                    for i in range(len(kv_cache_stride_order))
-                ]
-                kv_caches[layer_name] = kv_cache_raw_tensors[
-                    layer_name].view(dtype).view(kv_cache_shape).permute(
-                        *inv_order)
-            else:
-                raise NotImplementedError
-    return kv_caches
-    

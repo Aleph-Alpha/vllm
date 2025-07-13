@@ -11,7 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator, get_kv_cache_coordinator
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (BlockHash, KVCacheBlock,
                                          hash_request_tokens)
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager, get_manager_for_kv_cache_spec
@@ -24,7 +24,7 @@ from vllm.v1.request import Request, RequestStatus
 logger = init_logger(__name__)
 
 
-class HATKVCacheManager:
+class HATKVCacheManager(KVCacheManager):
 
     def __init__(
         self,
@@ -67,27 +67,6 @@ class HATKVCacheManager:
         self.req_id_to_hat_info: Dict[str, HATKVCacheState] = {}
         self.hat_splitter = HATRuleSplitter(special_token_dict=vllm_config.model_config.hf_config.special_token_dict,
                                             max_word_size = vllm_config.model_config.hf_config.max_word_size)
-
-    @property
-    def usage(self) -> float:
-        """Get the KV cache usage.
-
-        Returns:
-            The KV cache usage (between 0.0 and 1.0).
-        """
-        return self.block_pool.get_usage()
-
-    def make_prefix_cache_stats(self) -> Optional[PrefixCacheStats]:
-        """Get (and reset) the prefix cache stats.
-
-        Returns:
-            The current prefix caching stats, or None if logging is disabled.
-        """
-        if not self.log_stats:
-            return None
-        stats = self.prefix_cache_stats
-        self.prefix_cache_stats = PrefixCacheStats()
-        return stats
 
     def get_computed_blocks(self,
                             request: Request) -> tuple[KVCacheBlocks, int]:
@@ -266,96 +245,6 @@ class HATKVCacheManager:
         del self.req_id_to_hat_info[request.request_id]
         self.coordinator.free(request.request_id)
 
-    def reset_prefix_cache(self) -> bool:
-        """Reset prefix cache. This function may be used in RLHF
-        flows to invalidate prefix caching after the weights are updated,
-        or used for resetting prefix caching status for benchmarking.
-
-        Returns:
-            bool: True if the prefix cache is successfully reset,
-            False otherwise.
-        """
-        if not self.block_pool.reset_prefix_cache():
-            return False
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.reset = True
-        return True
-
-    def get_num_common_prefix_blocks(
-        self,
-        request: Request,
-        num_running_requests: int,
-    ) -> list[int]:
-        """Calculate the number of common prefix blocks shared by all requests
-        in the RUNNING state for each kv cache group.
-
-        The function determines this by selecting any request and iterating
-        through its blocks.  A block is considered a common prefix block if its
-        `ref_cnt` equals the total number of requests in the RUNNING state.
-
-        NOTE(woosuk): The number of requests in the RUNNING state is **greater
-        than or equal to** the number of requests scheduled in the current step.
-        This is because the RUNNING state only indicates that:
-        1. The request has not yet finished, and
-        2. The request holds its blocks unfreed.
-
-        While all scheduled requests must be in the RUNNING state, the inverse
-        is not necessarily true. There may be RUNNING requests that are not
-        scheduled in the current step.
-
-        This can result in an edge case where the number of common prefix blocks
-        is 0, even though all scheduled requests share a common prefix. This
-        occurs because there may be unscheduled RUNNING requests that do not
-        share the common prefix. Currently, this case cannot be easily detected,
-        so the function returns 0 in such cases.
-
-        Args:
-            request: Any request in the RUNNING state, used to identify the
-                common prefix blocks.
-            num_running_requests: The total number of requests in the RUNNING
-                state. This can be different from the number of scheduled
-                requests in the current step.
-
-        Returns:
-            list[int]: The number of common prefix blocks for each kv cache 
-            group.
-        """
-        assert request.status == RequestStatus.RUNNING
-        return self.coordinator.get_num_common_prefix_blocks(
-            request.request_id, num_running_requests)
-
-    def free_block_hashes(self, request: Request) -> None:
-        """Discard the block hashes for the request.
-
-        NOTE: Unlike `free`, this method should be called only when the request
-        is finished, not when it is preempted.
-        """
-        self.req_to_block_hashes.pop(request.request_id, None)
-
-    def take_events(self) -> list[KVCacheEvent]:
-        """Take the KV cache events from the block pool.
-
-        Returns:
-            A list of KV cache events.
-        """
-        return self.block_pool.take_events()
-
-    def get_block_ids(self, request_id: str) -> list[list[int]]:
-        """Get the block ids of a request."""
-        return KVCacheBlocks(
-            self.coordinator.get_blocks(request_id)).get_block_ids()
-
-    def cache_blocks(self, request: Request, block_hashes: list[BlockHash],
-                     num_computed_tokens: int) -> None:
-        """Cache the blocks for the request."""
-        self.coordinator.cache_blocks(request, block_hashes,
-                                      num_computed_tokens)
-
-    def create_empty_block_list(self) -> KVCacheBlocks:
-        """Creates a new KVCacheBlocks instance with no blocks."""
-        return KVCacheBlocks([[] for _ in range(self.num_kv_cache_groups)])
-
 
 class HATKVCacheCoordinator(HybridKVCacheCoordinator):
     """
@@ -414,21 +303,6 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
                 request_id, num_tokens[i], new_computed_blocks[i])
         return num_blocks_to_allocate
 
-    def save_new_computed_blocks(
-            self, request_id: str,
-            new_computed_blocks: list[list[KVCacheBlock]]) -> None:
-        """
-        Add the new computed blocks to the request.
-
-        Args:
-            request_id: The request ID.
-            new_computed_blocks: The new computed blocks just hitting the
-                prefix cache.
-        """
-        for i, manager in enumerate(self.single_type_managers):
-            manager.save_new_computed_blocks(request_id,
-                                             new_computed_blocks[i])
-
     def allocate_new_blocks(self, request_id: str,
                             num_tokens: List[int]) -> list[list[KVCacheBlock]]:
         """
@@ -445,8 +319,7 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
         """
         new_blocks = []
         for i, manager in enumerate(self.single_type_managers):
-            new_blocks.append(
-                manager.allocate_new_blocks(request_id, num_tokens[i]))
+            new_blocks.append(manager.allocate_new_blocks(request_id, num_tokens[i]))
         return new_blocks
 
     def cache_blocks(self, request: Request, block_hashes: list[BlockHash],
@@ -463,35 +336,6 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
         for i, manager in enumerate(self.single_type_managers):
             manager.cache_blocks(request, block_hashes, num_computed_tokens[i])
 
-    def free(self, request_id: str) -> None:
-        """
-        Free the blocks for the request.
-
-        Args:
-            request_id: The request ID.
-        """
-        for manager in self.single_type_managers:
-            manager.free(request_id)
-
-    def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> list[int]:
-        """
-        Get the number of common prefix blocks for a request.
-
-        Args:
-            request_id: The request ID.
-            block_hashes: The block hashes of the request.
-
-        Returns:
-            The number of common prefix blocks.
-        """
-        num_blocks_per_group = [
-            manager.get_num_common_prefix_blocks(request_id,
-                                                 num_running_requests)
-            for manager in self.single_type_managers
-        ]
-        return num_blocks_per_group
-
     def remove_skipped_blocks(self, request_id: str,
                               num_computed_tokens: List[int]) -> None:
         """
@@ -504,12 +348,3 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
         """
         for i, manager in enumerate(self.single_type_managers):
             manager.remove_skipped_blocks(request_id, num_computed_tokens[i])
-
-    def get_blocks(self, request_id: str) -> list[list[KVCacheBlock]]:
-        """
-        Get the blocks for the request.
-        """
-        return [
-            manager.req_to_blocks[request_id]
-            for manager in self.single_type_managers
-        ]
