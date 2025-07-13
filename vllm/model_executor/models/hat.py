@@ -1,16 +1,16 @@
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Iterable
+from typing import Any, Dict, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
-
 from transformers import PretrainedConfig
 
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -22,20 +22,15 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE,
-    ParallelLMHead,
-    VocabParallelEmbedding)
+    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils import direct_register_custom_op
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from .interfaces import SupportsLoRA
-from .utils import (AutoWeightsLoader,
-                    is_pp_missing_parameter,
-                    maybe_prefix)
+from .utils import AutoWeightsLoader, is_pp_missing_parameter, maybe_prefix
 
 
 class HATAttention(nn.Module):
@@ -105,7 +100,8 @@ class HATAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=rope_scaling["is_neox_style"] if "is_neox_style" in rope_scaling else True,
+            is_neox_style=rope_scaling["is_neox_style"]
+            if "is_neox_style" in rope_scaling else True,
         )
 
         self.attn = Attention(
@@ -210,7 +206,8 @@ class HATCrossAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=rope_scaling["is_neox_style"] if "is_neox_style" in rope_scaling else True,
+            is_neox_style=rope_scaling["is_neox_style"]
+            if "is_neox_style" in rope_scaling else True,
         )
 
     def forward(
@@ -229,7 +226,7 @@ class HATCrossAttention(nn.Module):
         q, _ = self.q_proj(q_input)
         kv, _ = self.kv_proj(kv_input)
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-        
+
         # L TODO: Fix this later
         q, _ = self.rotary_emb(q_position_ids, q, torch.zeros_like(q))
         _, k = self.rotary_emb(kv_position_ids, torch.zeros_like(k), k)
@@ -258,7 +255,7 @@ class HATCrossAttention(nn.Module):
         output, _ = self.o_proj(output.view(shape))
 
         return output
-    
+
 
 class HATGuideVectorAdd(nn.Module):
 
@@ -335,7 +332,7 @@ class HATGuideVectorAdd(nn.Module):
         word_lens_bytes: torch.Tensor,
     ) -> torch.Tensor:
         v, _ = self.v_proj(word_embeddings)
-        
+
         output, _ = self.o_proj(v)
         if word_lens_bytes is not None:
             output = output.repeat_interleave(word_lens_bytes, dim=0)
@@ -397,11 +394,11 @@ class HATTransformerLayer(nn.Module):
                 config.original_max_position_embeddings)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        
+
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
         bias_o_proj = attention_bias
-        
+
         if hasattr(config, 'qkv_bias'):
             attention_bias = config.qkv_bias
 
@@ -472,16 +469,15 @@ class HATDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.hidden_size = config.hidden_size
-        
+
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
         bias_o_proj = attention_bias
-        
+
         if hasattr(config, 'qkv_bias'):
             attention_bias = config.qkv_bias
 
-        self.query_norm = RMSNorm(config.hidden_size,
-                                  eps=config.rms_norm_eps)
+        self.query_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.kv_norm = RMSNorm(config.cross_attention_config.hidden_size_kv,
                                eps=config.rms_norm_eps)
 
@@ -491,8 +487,9 @@ class HATDecoderLayer(nn.Module):
             q_hidden_size=config.cross_attention_config.hidden_size_q,
             kv_hidden_size=config.cross_attention_config.hidden_size_kv,
             num_heads=config.cross_attention_config.num_attention_heads,
-            num_kv_heads=getattr(config.cross_attention_config, "attention_num_kv_heads",
-                                 config.cross_attention_config.num_attention_heads),
+            num_kv_heads=getattr(
+                config.cross_attention_config, "attention_num_kv_heads",
+                config.cross_attention_config.num_attention_heads),
             quant_config=quant_config,
             bias=attention_bias,
             bias_o_proj=bias_o_proj,
@@ -517,8 +514,7 @@ class HATDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.query_norm(hidden_states)
         else:
-            hidden_states, residual = self.query_norm(
-                hidden_states, residual)
+            hidden_states, residual = self.query_norm(hidden_states, residual)
         word_embeddings = self.kv_norm(predictive_word_embeddings)
 
         hidden_states = self.cross_attention(
@@ -526,7 +522,8 @@ class HATDecoderLayer(nn.Module):
             word_lens_bytes=word_lens_bytes,
         )
 
-        hidden_states, residual = self.llama_layer(positions, hidden_states, residual)
+        hidden_states, residual = self.llama_layer(positions, hidden_states,
+                                                   residual)
         return hidden_states, residual
 
 
@@ -551,15 +548,16 @@ class HATEncoderConnector(nn.Module):
                 config.original_max_position_embeddings)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        
+
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
         bias_o_proj = attention_bias
-        
+
         if hasattr(config, 'qkv_bias'):
             attention_bias = config.qkv_bias
 
-        self.latent_query = torch.nn.Parameter(torch.empty(1, 1, self.hidden_size)) 
+        self.latent_query = torch.nn.Parameter(
+            torch.empty(1, 1, self.hidden_size))
 
         self.cross_attention_encoder_connector = HATCrossAttention(
             config=config,
@@ -567,8 +565,9 @@ class HATEncoderConnector(nn.Module):
             q_hidden_size=config.cross_attention_config.hidden_size_q,
             kv_hidden_size=config.cross_attention_config.hidden_size_kv,
             num_heads=config.cross_attention_config.num_attention_heads,
-            num_kv_heads=getattr(config.cross_attention_config, "attention_num_kv_heads",
-                                 config.cross_attention_config.num_attention_heads),
+            num_kv_heads=getattr(
+                config.cross_attention_config, "attention_num_kv_heads",
+                config.cross_attention_config.num_attention_heads),
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
@@ -590,9 +589,13 @@ class HATEncoderConnector(nn.Module):
         latent = self.latent_query.squeeze(0)
         # L TODO: Remove expand
         latent_word_embeddings = latent.expand(word_positions.shape[0], -1)
-        
-        cu_seqlens_q = torch.arange(word_positions.shape[0] + 1, device=word_positions.device, dtype=torch.int32)
-        cu_seqlens_k = torch.cumsum(word_lens_bytes_flat, dim=0, dtype=torch.int32)
+
+        cu_seqlens_q = torch.arange(word_positions.shape[0] + 1,
+                                    device=word_positions.device,
+                                    dtype=torch.int32)
+        cu_seqlens_k = torch.cumsum(word_lens_bytes_flat,
+                                    dim=0,
+                                    dtype=torch.int32)
         max_seqlen_k = word_lens_bytes_flat.max()
 
         #scheduler_metadata = get_scheduler_metadata(
@@ -659,10 +662,11 @@ class HATEncoderModel(nn.Module):
 
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
-            self.layers.append(layer_type(config=config,
-                                      cache_config=cache_config,
-                                      quant_config=quant_config,
-                                      prefix=f"{prefix}.layers.{i}"))
+            self.layers.append(
+                layer_type(config=config,
+                           cache_config=cache_config,
+                           quant_config=quant_config,
+                           prefix=f"{prefix}.layers.{i}"))
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding_layer(input_ids)
@@ -719,12 +723,13 @@ class HATEncoderForCausalLM(nn.Module, SupportsLoRA):
         self.encoder = self._init_model(vllm_config=vllm_config,
                                         prefix=maybe_prefix(prefix, "encoder"),
                                         layer_type=layer_type)
-        
-        self.encoder_connector = HATEncoderConnector(config=config,
-                                                     cache_config=vllm_config.cache_config,
-                                                     quant_config=vllm_config.quant_config,
-                                                     prefix="encoder_connector")
-        
+
+        self.encoder_connector = HATEncoderConnector(
+            config=config,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            prefix="encoder_connector")
+
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
@@ -748,9 +753,13 @@ class HATEncoderForCausalLM(nn.Module, SupportsLoRA):
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["backbone", "decoder_connector",
-                                                        "lm_head", "layer_norm", "decoder"])
-        return loader.load_weights((name, loaded_weight) for name, loaded_weight in weights)
+        loader = AutoWeightsLoader(self,
+                                   skip_prefixes=[
+                                       "backbone", "decoder_connector",
+                                       "lm_head", "layer_norm", "decoder"
+                                   ])
+        return loader.load_weights(
+            (name, loaded_weight) for name, loaded_weight in weights)
 
 
 @support_torch_compile
@@ -772,10 +781,11 @@ class HATDecoderModel(nn.Module):
 
         self.decoder_layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
-            self.decoder_layers.append(layer_type(vllm_config=vllm_config,
-                                                  cache_config=cache_config,
-                                                  quant_config=quant_config,
-                                                  prefix=f"{prefix}.decoder_layers.{i}"))
+            self.decoder_layers.append(
+                layer_type(vllm_config=vllm_config,
+                           cache_config=cache_config,
+                           quant_config=quant_config,
+                           prefix=f"{prefix}.decoder_layers.{i}"))
 
     def forward(
         self,
@@ -789,7 +799,8 @@ class HATDecoderModel(nn.Module):
 
         for layer in self.decoder_layers:
             hidden_states, residual = layer(positions, hidden_states, residual,
-                                            word_lens_bytes, predictive_word_embeddings)
+                                            word_lens_bytes,
+                                            predictive_word_embeddings)
 
         if residual is not None:
             hidden_states = hidden_states + residual
@@ -803,7 +814,8 @@ class HATDecoderModel(nn.Module):
 
 class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
     packed_modules_mapping = {
-        "self_attn.qkv_proj": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+        "self_attn.qkv_proj":
+        ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
         "cross_attn.kv_proj": ["cross_attn.k_proj", "cross_attn.v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"]
     }
@@ -844,16 +856,14 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
                 DEFAULT_VOCAB_PADDING_SIZE
                 # We need bigger padding if using lora for kernel
                 # compatibility
-                if not lora_config else
-                lora_config.lora_vocab_padding_size),
+                if not lora_config else lora_config.lora_vocab_padding_size),
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
 
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
-                                                config.vocab_size,
-                                                logit_scale)
+                                                config.vocab_size, logit_scale)
 
         self.sampler = get_sampler()
 
@@ -876,7 +886,9 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
 
-        model_output = self.decoder(positions, previous_hidden_states, word_lens_bytes, predictive_word_embeddings)
+        model_output = self.decoder(positions, previous_hidden_states,
+                                    word_lens_bytes,
+                                    predictive_word_embeddings)
         model_output = self.layer_norm(model_output)
         return model_output
 
@@ -896,11 +908,15 @@ class HATDecoderForCausalLM(nn.Module, SupportsLoRA):
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["encoder", "backbone", "decoder_connector",
-                                                        "encoder_connector"])
-        return loader.load_weights((name, loaded_weight) for name, loaded_weight in weights)
+        loader = AutoWeightsLoader(self,
+                                   skip_prefixes=[
+                                       "encoder", "backbone",
+                                       "decoder_connector", "encoder_connector"
+                                   ])
+        return loader.load_weights(
+            (name, loaded_weight) for name, loaded_weight in weights)
 
-        
+
 @support_torch_compile
 class HATBackboneModel(nn.Module):
 
@@ -920,10 +936,11 @@ class HATBackboneModel(nn.Module):
 
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
-            self.layers.append(layer_type(config=config,
-                                          cache_config=cache_config,
-                                          quant_config=quant_config,
-                                          prefix=f"{prefix}.layers.{i}"))
+            self.layers.append(
+                layer_type(config=config,
+                           cache_config=cache_config,
+                           quant_config=quant_config,
+                           prefix=f"{prefix}.layers.{i}"))
 
     def forward(
         self,
@@ -948,9 +965,12 @@ class HATBackboneModel(nn.Module):
 
 class HATBackboneForCausalLM(nn.Module, SupportsLoRA):
     packed_modules_mapping = {
-        "self_attn.qkv_proj": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
-        "cross_attention_encoder_connector.kv_proj": ["cross_attention_encoder_connector.k_proj",
-                                                      "cross_attention_encoder_connector.v_proj"],
+        "self_attn.qkv_proj":
+        ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+        "cross_attention_encoder_connector.kv_proj": [
+            "cross_attention_encoder_connector.k_proj",
+            "cross_attention_encoder_connector.v_proj"
+        ],
         "gate_up_proj": ["gate_proj", "up_proj"]
     }
 
@@ -973,13 +993,16 @@ class HATBackboneForCausalLM(nn.Module, SupportsLoRA):
         self.lora_config = lora_config
 
         self.backbone = self._init_model(vllm_config=vllm_config,
-                                         prefix=maybe_prefix(prefix, "backbone"),
+                                         prefix=maybe_prefix(
+                                             prefix, "backbone"),
                                          layer_type=layer_type)
 
         # Hack to satisfy the weight loader
         self.decoder_connector = nn.Module()
-        first_word_embedding = torch.nn.Parameter(torch.empty(1, 1, config.hidden_size)) 
-        self.decoder_connector.register_parameter("first_word_embedding", first_word_embedding)
+        first_word_embedding = torch.nn.Parameter(
+            torch.empty(1, 1, config.hidden_size))
+        self.decoder_connector.register_parameter("first_word_embedding",
+                                                  first_word_embedding)
 
     def _init_model(self,
                     vllm_config: VllmConfig,
@@ -996,25 +1019,32 @@ class HATBackboneForCausalLM(nn.Module, SupportsLoRA):
         inputs_embeds: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
-        ) -> torch.Tensor:
+    ) -> torch.Tensor:
         model_output = self.backbone(positions, previous_hidden_states)
         return model_output
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
-        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["encoder", "decoder", "lm_head",
-                                                                     "layer_norm", "encoder_connector"])
-        return loader.load_weights((name, loaded_weight) for name, loaded_weight in weights)
-    
+        loader = AutoWeightsLoader(self,
+                                   ignore_unexpected_prefixes=[
+                                       "encoder", "decoder", "lm_head",
+                                       "layer_norm", "encoder_connector"
+                                   ])
+        return loader.load_weights(
+            (name, loaded_weight) for name, loaded_weight in weights)
 
-def _load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+
+def _load_weights(self, weights: Iterable[Tuple[str,
+                                                torch.Tensor]]) -> Set[str]:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
         ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
         ("self_attn.qkv_proj", "self_attn.k_proj", "k"),
         ("self_attn.qkv_proj", "self_attn.v_proj", "v"),
-        ("cross_attention_encoder_connector.kv_proj", "cross_attention_encoder_connector.k_proj", "k"),
-        ("cross_attention_encoder_connector.kv_proj", "cross_attention_encoder_connector.v_proj", "v"),
+        ("cross_attention_encoder_connector.kv_proj",
+         "cross_attention_encoder_connector.k_proj", "k"),
+        ("cross_attention_encoder_connector.kv_proj",
+         "cross_attention_encoder_connector.v_proj", "v"),
         (".gate_up_proj", ".gate_proj", 0),
         (".gate_up_proj", ".up_proj", 1),
     ]
@@ -1028,14 +1058,14 @@ def _load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]
             # Models trained using ColossalAI may include these tensors in
             # the checkpoint. Skip them.
             continue
-        if (self.quant_config is not None and
-            (scale_name := self.quant_config.get_cache_scale(name))):
+        if (self.quant_config is not None
+                and (scale_name := self.quant_config.get_cache_scale(name))):
             # Loading kv cache quantization scales
             param = params_dict[scale_name]
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
-            loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
-                                loaded_weight[0])
+            loaded_weight = (loaded_weight
+                             if loaded_weight.dim() == 0 else loaded_weight[0])
             weight_loader(param, loaded_weight)
             loaded_params.add(scale_name)
             continue
@@ -1048,7 +1078,7 @@ def _load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]
             if weight_name not in name:
                 continue
             name = name.replace(weight_name, param_name)
-            
+
             # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
                 continue
@@ -1067,11 +1097,11 @@ def _load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]
 
             if is_pp_missing_parameter(name, self):
                 continue
-            
+
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, loaded_weight)
         loaded_params.add(name)
-    
+
     return loaded_params

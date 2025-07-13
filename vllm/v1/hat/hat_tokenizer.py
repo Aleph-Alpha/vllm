@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+
 from jinja2.sandbox import ImmutableSandboxedEnvironment
-from typing import List, Optional, Union, Any, Dict
 
 from vllm.transformers_utils.tokenizer_base import TokenizerBase
 from vllm.utils import is_list_of
@@ -14,13 +17,13 @@ class Encoding:
 
 @dataclass
 class HATTokenizer(TokenizerBase):
-    
+
     def __init__(self, special_token_dict: Dict[str, int]):
         self.hat_splitter = HATRuleSplitter(special_token_dict)
         self.name_or_path = "HAT"
         self.jinja2_env = ImmutableSandboxedEnvironment()
         self.special_tokens_map = None
-    
+
     @property
     def all_special_tokens_extended(self) -> List[str]:
         raise NotImplementedError()
@@ -73,7 +76,7 @@ class HATTokenizer(TokenizerBase):
         max_length: Optional[int] = None,
     ):
         raise NotImplementedError()
-    
+
     def __call__(
         self,
         text: Union[str, List[str], List[int]],
@@ -120,7 +123,7 @@ class HATTokenizer(TokenizerBase):
                text: str,
                add_special_tokens: Optional[bool] = None) -> List[int]:
         return self.hat_splitter.encode_to_flattened(text)
-    
+
     def encode_to_words(self, text: str) -> List[List[int]]:
         return self.hat_splitter.encode(text)
 
@@ -131,12 +134,13 @@ class HATTokenizer(TokenizerBase):
                             tools: Optional[List[Dict[str, Any]]] = None,
                             **kwargs) -> str:
         compiled_template = self.jinja2_env.from_string(chat_template)
-        rendered = compiled_template.render(
-            messages=conversation, add_generation_prompt=True
-        )
+        rendered = compiled_template.render(messages=conversation,
+                                            add_generation_prompt=True)
         return rendered
-    
-    def get_chat_template(self, chat_template: Optional[str] = None, tools: Optional[List[Dict[str, Any]]]=None) -> str:
+
+    def get_chat_template(self,
+                          chat_template: Optional[str] = None,
+                          tools: Optional[List[Dict[str, Any]]] = None) -> str:
         # Only needed for some tests where the system prompt is not included.
         #return "{%- set loop_messages = messages -%}{%- for message in loop_messages -%}{%- set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n' + message['content'] | trim + '<|eot_id|>' -%}{%- if loop.index0 == 0 -%}{%- set content = '<|begin_of_text|><|start_header_id|>system<|end_header_id|>\nYou are a helpful assistant. You give engaging, well-structured answers to user inquiries.<|eot_id|>' + content -%}{%- endif -%}{{- content -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|start_header_id|>assistant<|end_header_id|>' -}}{%- endif -%}"
         # We might need \n at the end of each message.

@@ -1,66 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import copy
 import gc
 import time
-import weakref
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
 import torch.distributed
-import torch.nn as nn
 
-from vllm.attention import AttentionType, get_attn_backend
-from vllm.attention.backends.abstract import (AttentionBackend,
-                                              AttentionMetadataBuilder)
-from vllm.attention.layer import Attention
-from vllm.attention.utils.fa_utils import get_flash_attn_version
-from vllm.config import (CompilationLevel, VllmConfig,
-                         get_layers_from_vllm_config)
+from vllm.config import CompilationLevel, VllmConfig
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
-from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
-from vllm.distributed.parallel_state import (
-    get_pp_group, get_tp_group, graph_capture,
-    prepare_communication_buffer_for_model, GraphCaptureContext)
-from vllm.forward_context import (DPMetadata, get_forward_context,
-                                  set_forward_context)
+from vllm.distributed.parallel_state import (GraphCaptureContext, get_pp_group,
+                                             get_tp_group, graph_capture)
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
-from vllm.model_executor.models.hat import HATBackboneForCausalLM, HATDecoderForCausalLM, HATEncoderForCausalLM
-from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
-from vllm.multimodal.utils import group_mm_inputs_by_modality
+from vllm.model_executor.models.hat import (HATBackboneForCausalLM,
+                                            HATDecoderForCausalLM,
+                                            HATEncoderForCausalLM)
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
-from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        GiB_bytes, LazyLoader, async_tensor_h2d, cdiv,
-                        check_use_alibi, is_pin_memory_available, weak_ref_tensor)
+from vllm.utils import weak_ref_tensor
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
-from vllm.v1.core.sched.output import NewRequestData, CachedRequestData
-from vllm.v1.hat.hat_utils import COMPRESSION_RATIO, HATBatchInput, HATSubmodelRole
-from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
-                                        KVCacheConfig, KVCacheSpec,
-                                        SlidingWindowSpec)
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput)
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
-from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.medusa import MedusaProposer
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.hat.hat_utils import (COMPRESSION_RATIO, HATBatchInput,
+                                   HATSubmodelRole)
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.spec_decode.utils import is_spec_decode_supported
-from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.block_table import BlockTable
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -70,10 +41,10 @@ logger = init_logger(__name__)
 
 class HATModelRunner(GPUModelRunner):
 
-    def __init__( self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.role: Optional[HATSubmodelRole] = None
-        
+
         self.use_cuda_graph = not self.model_config.enforce_eager
         # Tensors for CUDA Graph Caching, set in load_model
         self.previous_hidden_states: Optional[torch.Tensor] = None
@@ -82,30 +53,35 @@ class HATModelRunner(GPUModelRunner):
         self.graphs = {}
         self.graph_memory_pool: Optional[Tuple[
             int, int]] = None  # Set during graph capture.
-        
+
         self.attn_metadata_ex = None
         self.logits_indices_ex = None
-        self.decoder_model_runner: Optional["HATModelRunner"] = None
-        
-    def set_decoder_model_runner(self, decoder_model_runner: "HATModelRunner") -> None:
+        self.decoder_model_runner: Optional[HATModelRunner] = None
+
+    def set_decoder_model_runner(
+            self, decoder_model_runner: "HATModelRunner") -> None:
         self.decoder_model_runner = decoder_model_runner
-    
+
     def load_model(self) -> None:
         super().load_model()
         self._set_role()
 
         match self.role:
             case HATSubmodelRole.DECODER:
-                self.previous_hidden_states = torch.zeros(self.vllm_config.compilation_config.max_capture_size,
+                self.previous_hidden_states = torch.zeros(
+                    self.vllm_config.compilation_config.max_capture_size,
                     self.model_config.hf_config.hidden_size,
                     dtype=self.dtype,
                     device=self.device)
-                self.predictive_word_embeddings = torch.zeros(self.vllm_config.compilation_config.max_capture_size,
-                    self.model_config.hf_config.cross_attention_config.hidden_size_kv,
+                self.predictive_word_embeddings = torch.zeros(
+                    self.vllm_config.compilation_config.max_capture_size,
+                    self.model_config.hf_config.cross_attention_config.
+                    hidden_size_kv,
                     dtype=self.dtype,
                     device=self.device)
             case HATSubmodelRole.BACKBONE:
-                self.previous_hidden_states = torch.zeros(self.vllm_config.compilation_config.max_capture_size,
+                self.previous_hidden_states = torch.zeros(
+                    self.vllm_config.compilation_config.max_capture_size,
                     self.model_config.hf_config.hidden_size,
                     dtype=self.dtype,
                     device=self.device)
@@ -170,7 +146,8 @@ class HATModelRunner(GPUModelRunner):
                 )
 
             state = self.requests[sched_req.req_id]
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[sched_req.req_id]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
+                sched_req.req_id]
 
             prompt_token_ids = state.prompt_token_ids
             self.input_batch.num_computed_tokens_cpu[idx] = 0
@@ -182,9 +159,10 @@ class HATModelRunner(GPUModelRunner):
                 self.input_batch.temperature_cpu[idx] = -1.0
                 self.input_batch.greedy_reqs.add(sched_req.req_id)
             else:
-                self.input_batch.temperature_cpu[idx] = sampling_params.temperature
+                self.input_batch.temperature_cpu[
+                    idx] = sampling_params.temperature
                 self.input_batch.random_reqs.add(sched_req.req_id)
-            
+
             self.input_batch._req_ids.append(sched_req.req_id)
             self.input_batch.block_table.add_row(sched_req.block_ids, idx)
             block_ids.extend(sched_req.block_ids)
@@ -193,8 +171,10 @@ class HATModelRunner(GPUModelRunner):
 
         for sched_req in scheduler_output.scheduled_cached_reqs:
             state = self.requests[sched_req.req_id]
-            num_new_tokens = scheduler_output.num_scheduled_tokens[sched_req.req_id]
-            self.input_batch.num_computed_tokens_cpu[idx] = sched_req.num_computed_tokens
+            num_new_tokens = scheduler_output.num_scheduled_tokens[
+                sched_req.req_id]
+            self.input_batch.num_computed_tokens_cpu[
+                idx] = sched_req.num_computed_tokens
             input_ids.extend(sched_req.new_token_ids)
 
             sampling_params = state.sampling_params
@@ -203,14 +183,14 @@ class HATModelRunner(GPUModelRunner):
                 self.input_batch.temperature_cpu[idx] = -1.0
                 self.input_batch.greedy_reqs.add(sched_req.req_id)
             else:
-                self.input_batch.temperature_cpu[idx] = sampling_params.temperature
+                self.input_batch.temperature_cpu[
+                    idx] = sampling_params.temperature
                 self.input_batch.random_reqs.add(sched_req.req_id)
-                
+
             if self.role != HATSubmodelRole.DECODER:
                 state.num_computed_tokens = sched_req.num_computed_tokens
                 num_new_tokens = (sched_req.num_computed_tokens +
-                                num_new_tokens -
-                                state.num_tokens)
+                                  num_new_tokens - state.num_tokens)
                 if num_new_tokens == 1:
                     # Avoid slicing list in most common case.
                     state.output_token_ids.append(sched_req.new_token_ids[-1])
@@ -259,7 +239,6 @@ class HATModelRunner(GPUModelRunner):
         cu_num_tokens, arange = self._get_cumsum_and_arange(
             num_scheduled_tokens)
 
-
         # Get positions.
         positions_np = self.positions_np[:total_num_scheduled_tokens]
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
@@ -300,12 +279,12 @@ class HATModelRunner(GPUModelRunner):
 
         # Copy the tensors to the GPU.
         assert input_ids.shape[0] == total_num_scheduled_tokens
-        self.input_ids[:total_num_scheduled_tokens].copy_(input_ids, non_blocking=True)
+        self.input_ids[:total_num_scheduled_tokens].copy_(input_ids,
+                                                          non_blocking=True)
 
         # Common case (1D positions)
         self.positions[:total_num_scheduled_tokens].copy_(
-            self.positions_cpu[:total_num_scheduled_tokens],
-            non_blocking=True)
+            self.positions_cpu[:total_num_scheduled_tokens], non_blocking=True)
 
         self.query_start_loc[:num_reqs + 1].copy_(
             self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
@@ -356,7 +335,7 @@ class HATModelRunner(GPUModelRunner):
         # TODO: Support prompt logprobs.
         logits_indices = query_start_loc[1:] - 1
         spec_decode_metadata = None
-        
+
         if self.role == HATSubmodelRole.ENCODER:
             self.decoder_model_runner.attn_metadata_ex = attn_metadata_i
             self.decoder_model_runner.logits_indices_ex = logits_indices
@@ -382,13 +361,15 @@ class HATModelRunner(GPUModelRunner):
         if not prepare_inputs:
             attn_metadata = self.attn_metadata_ex
             logits_indices = self.logits_indices_ex
-        else:   
-            attn_metadata, logits_indices, _ = self._prepare_inputs(scheduler_output)
+        else:
+            attn_metadata, logits_indices, _ = self._prepare_inputs(
+                scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         decoder_cuda_graph = (not self.role == HATSubmodelRole.DECODER) or hat_batch_input.word_lens_bytes is None \
             or hat_batch_input.word_lens_bytes.shape[0] == num_scheduled_tokens
-        use_cuda_graph = self.use_cuda_graph and decoder_cuda_graph and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
+        use_cuda_graph = self.use_cuda_graph and decoder_cuda_graph and num_scheduled_tokens <= self.cudagraph_batch_sizes[
+            -1]
 
         if use_cuda_graph:
             # Use piecewise CUDA graphs.
@@ -423,7 +404,9 @@ class HATModelRunner(GPUModelRunner):
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
 
-        model_kwargs = self._get_model_kwargs(input_ids, positions, num_input_tokens, hat_batch_input, use_cuda_graph)
+        model_kwargs = self._get_model_kwargs(input_ids, positions,
+                                              num_input_tokens,
+                                              hat_batch_input, use_cuda_graph)
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
@@ -462,7 +445,7 @@ class HATModelRunner(GPUModelRunner):
             logits = self.model.compute_logits(sample_hidden_states, None)
         else:
             return hidden_states[:num_scheduled_tokens, :]
-        
+
         if broadcast_pp_output:
             model_output_broadcast_data = {
                 "logits": logits.contiguous(),
@@ -540,14 +523,19 @@ class HATModelRunner(GPUModelRunner):
             finished_sending=finished_sending,
             finished_recving=finished_recving,
         )
-        
-    def _copy_cuda_graph_inputs(self, hat_batch_input: HATBatchInput, num_scheduled_tokens: int) -> None:
+
+    def _copy_cuda_graph_inputs(self, hat_batch_input: HATBatchInput,
+                                num_scheduled_tokens: int) -> None:
         match self.role:
             case HATSubmodelRole.DECODER:
-                self.previous_hidden_states[:num_scheduled_tokens, :].copy_(hat_batch_input.encoder_hidden_states, non_blocking=True)
-                self.predictive_word_embeddings[:num_scheduled_tokens, :].copy_(hat_batch_input.predictive_word_embeddings, non_blocking=True)
+                self.previous_hidden_states[:num_scheduled_tokens, :].copy_(
+                    hat_batch_input.encoder_hidden_states, non_blocking=True)
+                self.predictive_word_embeddings[:num_scheduled_tokens, :].copy_(
+                    hat_batch_input.predictive_word_embeddings,
+                    non_blocking=True)
             case HATSubmodelRole.BACKBONE:
-                self.previous_hidden_states[:num_scheduled_tokens, :].copy_(hat_batch_input.latent_word_embeddings, non_blocking=True)
+                self.previous_hidden_states[:num_scheduled_tokens, :].copy_(
+                    hat_batch_input.latent_word_embeddings, non_blocking=True)
             case HATSubmodelRole.ENCODER:
                 pass
 
@@ -608,7 +596,8 @@ class HATModelRunner(GPUModelRunner):
         with self.maybe_dummy_run_with_lora(self.lora_config,
                                             num_scheduled_tokens):
             model = self.model
-            model_kwargs = self._get_dummy_model_kwargs(num_tokens, create_tensors=create_input_tensors)
+            model_kwargs = self._get_dummy_model_kwargs(
+                num_tokens, create_tensors=create_input_tensors)
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -635,18 +624,21 @@ class HATModelRunner(GPUModelRunner):
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         return outputs[logit_indices]
-    
+
     def profile_run(self) -> None:
-        hidden_states = self._dummy_run(max(1, self.max_num_tokens // COMPRESSION_RATIO)
-                                        if self.role == HATSubmodelRole.BACKBONE else self.max_num_tokens, create_input_tensors=True)
-        if get_pp_group().is_last_rank and self.role == HATSubmodelRole.DECODER:
+        hidden_states = self._dummy_run(
+            max(1, self.max_num_tokens // COMPRESSION_RATIO)
+            if self.role == HATSubmodelRole.BACKBONE else self.max_num_tokens,
+            create_input_tensors=True)
+        if get_pp_group(
+        ).is_last_rank and self.role == HATSubmodelRole.DECODER:
             sampler_output = self._dummy_sampler_run(hidden_states)
         else:
             sampler_output = None
         self._sync_device()
         del hidden_states, sampler_output
         gc.collect()
-    
+
     @torch.inference_mode()
     def _capture(
         self,
@@ -677,7 +669,7 @@ class HATModelRunner(GPUModelRunner):
         self.seq_lens_np[:num_reqs] = self.max_model_len
         self.seq_lens_np[num_reqs:] = 0
         self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
-                                        non_blocking=True)
+                                       non_blocking=True)
         seq_lens = self.seq_lens[:num_reqs]
 
         common_attn_metadata = CommonAttentionMetadata(
@@ -698,7 +690,8 @@ class HATModelRunner(GPUModelRunner):
                 attn_metadata[layer_name] = attn_metadata_i
 
         model = self.model
-        model_kwargs = self._get_dummy_model_kwargs(num_tokens, create_tensors=False)
+        model_kwargs = self._get_dummy_model_kwargs(num_tokens,
+                                                    create_tensors=False)
 
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
@@ -716,27 +709,25 @@ class HATModelRunner(GPUModelRunner):
         torch.cuda.synchronize()
         # Capture the graph.
         graph = torch.cuda.CUDAGraph()
-        with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens,
-                num_tokens_across_dp=num_tokens_across_dp):
-            with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=graph_capture_context.stream):
+        with set_forward_context(attn_metadata,
+                                 self.vllm_config,
+                                 num_tokens=num_tokens,
+                                 num_tokens_across_dp=num_tokens_across_dp):
+            with torch.cuda.graph(graph,
+                                  pool=self.graph_memory_pool,
+                                  stream=graph_capture_context.stream):
                 outputs = model(
                     **model_kwargs,
                     intermediate_tensors=intermediate_tensors,
                 )
                 if isinstance(outputs, torch.Tensor):
-                    graph_outputs = weak_ref_tensor(
-                        outputs)
+                    graph_outputs = weak_ref_tensor(outputs)
                 elif isinstance(outputs, IntermediateTensors):
                     graph_outputs = IntermediateTensors(
                         tensors={
                             key: weak_ref_tensor(value)
-                            for key, value in
-                            outputs.tensors.items()
+                            for key, value in outputs.tensors.items()
                         })
-                
 
                 del outputs
                 gc.collect()
@@ -775,7 +766,10 @@ class HATModelRunner(GPUModelRunner):
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
 
-    def _get_dummy_model_kwargs(self, num_input_tokens: int, create_tensors: bool = False) -> dict[str, Any]:
+    def _get_dummy_model_kwargs(
+            self,
+            num_input_tokens: int,
+            create_tensors: bool = False) -> dict[str, Any]:
         match self.role:
             case HATSubmodelRole.ENCODER:
                 model_kwargs = {
@@ -784,12 +778,14 @@ class HATModelRunner(GPUModelRunner):
                     "positions": self.positions[:num_input_tokens],
                 }
             case HATSubmodelRole.BACKBONE:
-                previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
+                previous_hidden_states = self.previous_hidden_states[:
+                                                                     num_input_tokens, :]
                 if create_tensors:
-                    previous_hidden_states = torch.zeros(num_input_tokens,
-                                                        self.model_config.hf_config.hidden_size,
-                                                        dtype=self.dtype,
-                                                        device=self.device)
+                    previous_hidden_states = torch.zeros(
+                        num_input_tokens,
+                        self.model_config.hf_config.hidden_size,
+                        dtype=self.dtype,
+                        device=self.device)
                 model_kwargs = {
                     "input_ids": None,
                     "inputs_embeds": None,
@@ -797,17 +793,22 @@ class HATModelRunner(GPUModelRunner):
                     "previous_hidden_states": previous_hidden_states,
                 }
             case HATSubmodelRole.DECODER:
-                previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
-                predictive_word_embeddings = self.predictive_word_embeddings[:num_input_tokens, :]
+                previous_hidden_states = self.previous_hidden_states[:
+                                                                     num_input_tokens, :]
+                predictive_word_embeddings = self.predictive_word_embeddings[:
+                                                                             num_input_tokens, :]
                 if create_tensors:
-                    previous_hidden_states = torch.zeros(num_input_tokens,
-                                                        self.model_config.hf_config.hidden_size,
-                                                        dtype=self.dtype,
-                                                        device=self.device)
-                    predictive_word_embeddings = torch.zeros(num_input_tokens,
-                                                            self.model_config.hf_config.cross_attention_config.hidden_size_kv,
-                                                            dtype=self.dtype,
-                                                            device=self.device)
+                    previous_hidden_states = torch.zeros(
+                        num_input_tokens,
+                        self.model_config.hf_config.hidden_size,
+                        dtype=self.dtype,
+                        device=self.device)
+                    predictive_word_embeddings = torch.zeros(
+                        num_input_tokens,
+                        self.model_config.hf_config.cross_attention_config.
+                        hidden_size_kv,
+                        dtype=self.dtype,
+                        device=self.device)
                 model_kwargs = {
                     # Reuse input_ids for word positions, because the decoder does not need input_ids
                     "input_ids": None,
@@ -819,7 +820,8 @@ class HATModelRunner(GPUModelRunner):
                 }
         return model_kwargs
 
-    def _get_model_kwargs(self, input_ids: torch.Tensor,
+    def _get_model_kwargs(self,
+                          input_ids: torch.Tensor,
                           positions: torch.Tensor,
                           num_input_tokens: int,
                           hat_batch_input: Optional[HATBatchInput] = None,
@@ -834,7 +836,8 @@ class HATModelRunner(GPUModelRunner):
             case HATSubmodelRole.BACKBONE:
                 previous_hidden_states = hat_batch_input.latent_word_embeddings
                 if use_cuda_graph:
-                    previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
+                    previous_hidden_states = self.previous_hidden_states[:
+                                                                         num_input_tokens, :]
                 model_kwargs = {
                     "input_ids": None,
                     "inputs_embeds": None,
@@ -846,8 +849,10 @@ class HATModelRunner(GPUModelRunner):
                 predictive_word_embeddings = hat_batch_input.predictive_word_embeddings
                 word_lens_bytes = hat_batch_input.word_lens_bytes
                 if use_cuda_graph:
-                    previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
-                    predictive_word_embeddings = self.predictive_word_embeddings[:num_input_tokens, :]
+                    previous_hidden_states = self.previous_hidden_states[:
+                                                                         num_input_tokens, :]
+                    predictive_word_embeddings = self.predictive_word_embeddings[:
+                                                                                 num_input_tokens, :]
                     word_lens_bytes = None
 
                 model_kwargs = {
@@ -871,7 +876,7 @@ class HATModelRunner(GPUModelRunner):
         self.kv_cache_config = kv_cache_config
         self.may_reinitialize_input_batch(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
-    
+
     def _set_role(self) -> None:
         if isinstance(self.model, HATEncoderForCausalLM):
             self.role = HATSubmodelRole.ENCODER
@@ -880,4 +885,6 @@ class HATModelRunner(GPUModelRunner):
         elif isinstance(self.model, HATBackboneForCausalLM):
             self.role = HATSubmodelRole.BACKBONE
         else:
-            raise ValueError(f"Unknown HAT model role: {type(self.model)}. Can't instantiate HATModelRunner.")
+            raise ValueError(
+                f"Unknown HAT model role: {type(self.model)}. Can't instantiate HATModelRunner."
+            )

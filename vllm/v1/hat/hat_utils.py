@@ -1,14 +1,16 @@
-from enum import Enum
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Optional, Tuple
+
 import torch
 
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
-
 
 # Constants
 
@@ -18,13 +20,14 @@ LIMIT_FOR_STATIC_STEPS = 8
 
 # Data Classes
 
+
 @dataclass
 class HATSequenceState:
     # Store bytes of the current word and first byte of new word
     curr_word_bytes: List[int]
     new_word_first_bytes: Optional[List[int]]
     # For preemptions this includes previously computed decode tokens
-    num_prompt_tokens: int 
+    num_prompt_tokens: int
 
     # These are updated for each step
     num_scheduled_tokens_backbone: int
@@ -32,12 +35,13 @@ class HATSequenceState:
     word_lens_bytes: List[int]
     block_table_backbone: List[List[int]]
 
-    # Chunked prefill specific 
+    # Chunked prefill specific
     len_last_word_chunked: int
     multi_bytes: int
 
     # Predictive word embedding from the previous word (needed by the decoder)
-    prev_pred_backbone_embedding: Optional[torch.Tensor] # Shape [word_windwow_size, hidden_size]
+    prev_pred_backbone_embedding: Optional[
+        torch.Tensor]  # Shape [word_windwow_size, hidden_size]
 
     # Encoder outputs for the current word (needed by encoder_connector and decoder)
     encoder_embeds_curr_word: List[torch.Tensor]
@@ -46,7 +50,7 @@ class HATSequenceState:
     # Byte and word position of the current sequence we are generating tokens for
     word_position_cpu: torch.Tensor
     byte_position: int
-    
+
     request_type: "HATRequestType"
 
 
@@ -70,7 +74,7 @@ class HATEncoderHiddenStatesPhases:
     encoder_hidden_states_encoder_connector: List[torch.Tensor]
     encoder_hidden_states_enc_dec_loop: Optional[torch.Tensor]
     encoder_hidden_states_final_decoder: Optional[torch.Tensor]
-    
+
 
 @dataclass
 class HATEncoderConnectorInput:
@@ -81,6 +85,7 @@ class HATEncoderConnectorInput:
 
 
 # Enums
+
 
 class HATSubmodelRole(str, Enum):
     ENCODER = "encoder"
@@ -96,7 +101,7 @@ class HATRequestType(str, Enum):
 
 
 # Helper Functions
-    
+
 
 def _create_empty_scheduler_output() -> SchedulerOutput:
     return SchedulerOutput(
@@ -124,9 +129,11 @@ def _create_empty_model_runner_output() -> ModelRunnerOutput:
                              prompt_logprobs_dict={},
                              finished_sending=None,
                              finished_recving=None)
-    
-    
-def safe_tensor_slice(tensor: torch.Tensor, count: int, keep_prefix: bool=True) -> Optional[torch.Tensor]:
+
+
+def safe_tensor_slice(tensor: torch.Tensor,
+                      count: int,
+                      keep_prefix: bool = True) -> Optional[torch.Tensor]:
     if count == 0:
         if keep_prefix:
             return tensor
@@ -137,28 +144,33 @@ def safe_tensor_slice(tensor: torch.Tensor, count: int, keep_prefix: bool=True) 
             return tensor[:-count, :]
         else:
             return tensor[-count:, :]
-        
-        
-def safe_list_slice(list: List, count: int, keep_prefix: bool=True) -> Optional[List]:
-        if count == 0:
-            if keep_prefix:
-                return list
-            else:
-                return []
+
+
+def safe_list_slice(list: List,
+                    count: int,
+                    keep_prefix: bool = True) -> Optional[List]:
+    if count == 0:
+        if keep_prefix:
+            return list
         else:
-            if keep_prefix:
-                return list[:-count]
-            else:
-                return list[-count:]
-            
-            
-def split_text(hat_splitter: HATRuleSplitter, text_bytes: List[int]) -> List[List[int]]:
+            return []
+    else:
+        if keep_prefix:
+            return list[:-count]
+        else:
+            return list[-count:]
+
+
+def split_text(hat_splitter: HATRuleSplitter,
+               text_bytes: List[int]) -> List[List[int]]:
     """Splits a text into its constituent words in bytes."""
     prev_num_bytes = len(text_bytes)
-    text = hat_splitter.decode(text_bytes, skip_special_tokens=False, errors="ignore")
+    text = hat_splitter.decode(text_bytes,
+                               skip_special_tokens=False,
+                               errors="ignore")
     list_of_words_in_bytes = hat_splitter.encode(text)
     after_num_bytes = sum(len(word) for word in list_of_words_in_bytes)
-    
+
     # For incomplete multi-byte characters, we need to add the remaining bytes to the last word
     # This can happen for chunked prefills
     diff = prev_num_bytes - after_num_bytes
@@ -170,11 +182,15 @@ def split_text(hat_splitter: HATRuleSplitter, text_bytes: List[int]) -> List[Lis
     return list_of_words_in_bytes
 
 
-def check_byte_for_new_word(hat_splitter: HATRuleSplitter, word: List[int]) -> Tuple[bool, Optional[List[List[int]]]]:
+def check_byte_for_new_word(
+        hat_splitter: HATRuleSplitter,
+        word: List[int]) -> Tuple[bool, Optional[List[List[int]]]]:
     if len(word) > hat_splitter.max_word_size:
         return True, None
     try:
-        word_str = hat_splitter.decode(word, errors="strict", skip_special_tokens=False)
+        word_str = hat_splitter.decode(word,
+                                       errors="strict",
+                                       skip_special_tokens=False)
         w = hat_splitter.encode(word_str)
     except UnicodeDecodeError as e:
         if "invalid start byte" in e.reason:
@@ -199,16 +215,16 @@ def _allocate_kv_cache_tensors(
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         tensor = torch.zeros(kv_cache_tensor.size,
-                                dtype=torch.int8,
-                                device="cuda")
+                             dtype=torch.int8,
+                             device="cuda")
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 
     layer_names = set()
     for group in kv_cache_config.kv_cache_groups:
         layer_names.update(group.layer_names)
-    assert layer_names == set(kv_cache_raw_tensors.keys(
-    )), "Some layers are not correctly initialized"
+    assert layer_names == set(kv_cache_raw_tensors.keys()
+                              ), "Some layers are not correctly initialized"
     return kv_cache_raw_tensors
 
 
@@ -229,14 +245,12 @@ def _reshape_kv_cache_tensors(
         corresponding memory buffer for KV cache.
     """
     kv_caches: dict[str, torch.Tensor] = {}
-    for i, kv_cache_group_spec in enumerate(
-            kv_cache_config.kv_cache_groups):
+    for i, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
         kv_cache_spec = kv_cache_group_spec.kv_cache_spec
         for layer_name in kv_cache_group_spec.layer_names:
             raw_tensor = kv_cache_raw_tensors[layer_name]
             assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = (raw_tensor.numel() //
-                            kv_cache_spec.page_size_bytes)
+            num_blocks = (raw_tensor.numel() // kv_cache_spec.page_size_bytes)
             if isinstance(kv_cache_spec, AttentionSpec):
                 kv_cache_shape = attn_backends[i].get_kv_cache_shape(
                     num_blocks, kv_cache_spec.block_size,
@@ -245,27 +259,23 @@ def _reshape_kv_cache_tensors(
                 try:
                     kv_cache_stride_order = attn_backends[
                         i].get_kv_cache_stride_order()
-                    assert len(kv_cache_stride_order) == len(
-                        kv_cache_shape)
+                    assert len(kv_cache_stride_order) == len(kv_cache_shape)
                 except (AttributeError, NotImplementedError):
-                    kv_cache_stride_order = tuple(
-                        range(len(kv_cache_shape)))
+                    kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                 # The allocation respects the backend-defined stride order
                 # to ensure the semantic remains consistent for each
                 # backend. We first obtain the generic kv cache shape and
                 # then permute it according to the stride order which could
                 # result in a non-contiguous tensor.
                 kv_cache_shape = tuple(kv_cache_shape[i]
-                                        for i in kv_cache_stride_order)
+                                       for i in kv_cache_stride_order)
                 # Maintain original KV shape view.
                 inv_order = [
                     kv_cache_stride_order.index(i)
                     for i in range(len(kv_cache_stride_order))
                 ]
-                kv_caches[layer_name] = kv_cache_raw_tensors[
-                    layer_name].view(dtype).view(kv_cache_shape).permute(
-                        *inv_order)
+                kv_caches[layer_name] = kv_cache_raw_tensors[layer_name].view(
+                    dtype).view(kv_cache_shape).permute(*inv_order)
             else:
                 raise NotImplementedError
     return kv_caches
-    

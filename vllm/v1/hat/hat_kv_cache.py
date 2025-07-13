@@ -2,24 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils import sha256
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator, get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.core.kv_cache_utils import (BlockHash, KVCacheBlock,
-                                         hash_request_tokens)
-from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager, get_manager_for_kv_cache_spec
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.single_type_kv_cache_manager import (
+    SingleTypeKVCacheManager, get_manager_for_kv_cache_spec)
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
-from vllm.v1.hat.hat_utils import HATKVCacheState, check_byte_for_new_word, split_text
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, SlidingWindowSpec
+from vllm.v1.hat.hat_utils import HATKVCacheState, split_text
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                        SlidingWindowSpec)
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -63,10 +62,12 @@ class HATKVCacheManager(KVCacheManager):
         # `get_computed_blocks` or `allocate_slots`.
         self.req_to_block_hashes: defaultdict[
             str, list[BlockHash]] = defaultdict(list)
-        
+
         self.req_id_to_hat_info: Dict[str, HATKVCacheState] = {}
-        self.hat_splitter = HATRuleSplitter(special_token_dict=vllm_config.model_config.hf_config.special_token_dict,
-                                            max_word_size = vllm_config.model_config.hf_config.max_word_size)
+        self.hat_splitter = HATRuleSplitter(
+            special_token_dict=vllm_config.model_config.hf_config.
+            special_token_dict,
+            max_word_size=vllm_config.model_config.hf_config.max_word_size)
 
     def get_computed_blocks(self,
                             request: Request) -> tuple[KVCacheBlocks, int]:
@@ -141,36 +142,59 @@ class HATKVCacheManager(KVCacheManager):
         req_id = request.request_id
         new_slots_needed_backbone = 0
         if req_id not in self.req_id_to_hat_info:
-            self.req_id_to_hat_info[req_id] = HATKVCacheState(num_curr_word_bytes=0, num_computed_tokens_backbone=0, num_computed_tokens_byte=0)
-            words = split_text(self.hat_splitter, request._all_token_ids[:num_new_tokens])
+            self.req_id_to_hat_info[req_id] = HATKVCacheState(
+                num_curr_word_bytes=0,
+                num_computed_tokens_backbone=0,
+                num_computed_tokens_byte=0)
+            words = split_text(self.hat_splitter,
+                               request._all_token_ids[:num_new_tokens])
             # Allocate a slot for the incomplete word here, so we are always one step ahead
             new_slots_needed_backbone = len(words)
-            
-            self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[-1])
-            self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone = new_slots_needed_backbone
-            self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte = num_new_tokens
-            
+
+            self.req_id_to_hat_info[
+                request.request_id].num_curr_word_bytes = len(words[-1])
+            self.req_id_to_hat_info[
+                request.
+                request_id].num_computed_tokens_backbone = new_slots_needed_backbone
+            self.req_id_to_hat_info[
+                request.request_id].num_computed_tokens_byte = num_new_tokens
+
         else:
             if len(request._all_token_ids) - request.num_computed_tokens == 1:
-                num_new_tokens = len(request._all_token_ids) - self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte
-            start_idx = self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte - self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
-            offset = num_new_tokens + self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
-            words = split_text(self.hat_splitter, request._all_token_ids[start_idx:start_idx + offset])
-            
+                num_new_tokens = len(
+                    request._all_token_ids) - self.req_id_to_hat_info[
+                        request.request_id].num_computed_tokens_byte
+            start_idx = self.req_id_to_hat_info[
+                request.
+                request_id].num_computed_tokens_byte - self.req_id_to_hat_info[
+                    request.request_id].num_curr_word_bytes
+            offset = num_new_tokens + self.req_id_to_hat_info[
+                request.request_id].num_curr_word_bytes
+            words = split_text(
+                self.hat_splitter,
+                request._all_token_ids[start_idx:start_idx + offset])
+
             if len(words) > 1:
-                self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[-1])
+                self.req_id_to_hat_info[
+                    request.request_id].num_curr_word_bytes = len(words[-1])
                 new_slots_needed_backbone = len(words) - 1
-                self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone += new_slots_needed_backbone
+                self.req_id_to_hat_info[
+                    request.
+                    request_id].num_computed_tokens_backbone += new_slots_needed_backbone
             else:
-                self.req_id_to_hat_info[request.request_id].num_curr_word_bytes = len(words[0])
-            self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte += num_new_tokens
-        
-        num_tokens_backbone = self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone
-        
+                self.req_id_to_hat_info[
+                    request.request_id].num_curr_word_bytes = len(words[0])
+            self.req_id_to_hat_info[
+                request.request_id].num_computed_tokens_byte += num_new_tokens
+
+        num_tokens_backbone = self.req_id_to_hat_info[
+            request.request_id].num_computed_tokens_backbone
+
         num_tokens_need_slot = min(
-            self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte + num_lookahead_tokens,
-            self.max_model_len)
-        
+            self.req_id_to_hat_info[
+                request.request_id].num_computed_tokens_byte +
+            num_lookahead_tokens, self.max_model_len)
+
         list_num_tokens_need_slot = []
         list_num_tokens_cache = []
         list_num_computed_tokens = []
@@ -179,12 +203,16 @@ class HATKVCacheManager(KVCacheManager):
             if isinstance(kv_cache_spec, FullAttentionSpec):
                 list_num_tokens_need_slot.append(num_tokens_backbone)
                 list_num_tokens_cache.append(num_tokens_backbone)
-                list_num_computed_tokens.append(num_tokens_backbone - new_slots_needed_backbone)
+                list_num_computed_tokens.append(num_tokens_backbone -
+                                                new_slots_needed_backbone)
             elif isinstance(kv_cache_spec, SlidingWindowSpec):
                 list_num_tokens_need_slot.append(num_tokens_need_slot)
-                list_num_tokens_cache.append(num_tokens_need_slot - num_lookahead_tokens)
-                list_num_computed_tokens.append(num_tokens_need_slot - num_new_tokens - num_lookahead_tokens)
-            
+                list_num_tokens_cache.append(num_tokens_need_slot -
+                                             num_lookahead_tokens)
+                list_num_computed_tokens.append(num_tokens_need_slot -
+                                                num_new_tokens -
+                                                num_lookahead_tokens)
+
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
         # We can do this even if we cannot schedule this request due to
@@ -319,7 +347,8 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
         """
         new_blocks = []
         for i, manager in enumerate(self.single_type_managers):
-            new_blocks.append(manager.allocate_new_blocks(request_id, num_tokens[i]))
+            new_blocks.append(
+                manager.allocate_new_blocks(request_id, num_tokens[i]))
         return new_blocks
 
     def cache_blocks(self, request: Request, block_hashes: list[BlockHash],
