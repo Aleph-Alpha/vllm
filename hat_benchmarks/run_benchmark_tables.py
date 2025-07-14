@@ -79,6 +79,13 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         help="Uses a longer system prompt",
     )
+    parser.add_argument(
+        "--heterogeneous",
+        type=bool,
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Use heterogeneous batch sizes",
+    )
     return parser.parse_args()
 
 
@@ -116,8 +123,10 @@ if __name__ == "__main__":
     language = args.language
     max_batch_size = args.max_batch_size
     average = args.average
+    heterogeneous = args.heterogeneous
     long_system_prompt = args.long_system_prompt
     
+    max_bytes = max_bytes if not heterogeneous else 5000
     max_tokens = get_max_tokens(model, language, max_bytes)
     sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
 
@@ -132,10 +141,11 @@ if __name__ == "__main__":
               compilation_config={"full_cuda_graph": True, "level": 0},
               tensor_parallel_size=1,
               gpu_memory_utilization=0.9,
+              enable_prefix_caching=False,
               block_size=16,
               disable_cascade_attn=True,
               max_model_len=130000,
-              max_num_batched_tokens=130000,
+              max_num_batched_tokens=200000,
               max_num_seqs=128) # Can be set to 100k on A100
     
     tokenizer = llm.get_tokenizer()

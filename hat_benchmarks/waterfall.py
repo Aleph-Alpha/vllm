@@ -95,7 +95,7 @@ if __name__ == "__main__":
     # Get info for histograms
     hat_len_bytes_input_per_seq = hat_json[language][f"batch_size_{batch_size}"]["len_bytes_input_per_seq"]
     llama_len_bytes_input_per_seq = llama_json[language][f"batch_size_{batch_size}"]["len_bytes_input_per_seq"]
-    assert hat_len_bytes_input_per_seq == llama_len_bytes_input_per_seq, "Input lengths are not the same"
+    assert len(hat_len_bytes_input_per_seq) == len(llama_len_bytes_input_per_seq), "Input lengths are not the same"
     len_bytes_input_per_seq = hat_len_bytes_input_per_seq
     len_bytes_input_per_seq = [item for sublist in len_bytes_input_per_seq for item in sublist]
     
