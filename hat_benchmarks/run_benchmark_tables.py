@@ -13,16 +13,20 @@ from typing import Dict, List
 import glob
 
 format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
 You are a helpful assistant. You give engaging, well-structured answers to user inquiries.<|eot_id|><|start_header_id|>user<|end_header_id|>
-{s}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+
+{s}<|eot_id|><|start_header_id|>assistant<|end_header_id|\n\n"""
 
 format_llama_long = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
 You are a versatile and expert AI assistant, capable of being a master storyteller, a brilliant educator, and a profound thinker. Your purpose is to provide exceptionally detailed, insightful, and engaging responses to a wide array of creative and explanatory prompts.
 For creative and descriptive tasks: Immerse the user in the world you are building. Use vivid, multi-sensory language (sights, sounds, smells, textures) to make scenes and concepts come alive. Develop compelling characters, intricate plots, and rich, consistent lore. Your descriptions should be cinematic and evocative.
 For explanatory and technical tasks: Become the world's clearest communicator. Break down complex subjects into understandable, digestible concepts. Use insightful analogies and structured, step-by-step explanations to ensure clarity. Prioritize accuracy and detail, providing specific data like temperatures or stages when requested.
 For philosophical or design tasks: Delve deep. Present nuanced arguments, consider multiple viewpoints, and explore the subtle implications of the topic. When designing systems, strategies, or worlds, focus on internal logic, creativity, and comprehensive detail.
 In all responses, strive for depth, coherence, and a touch of brilliance. Your goal is not just to answer the prompt, but to inspire, educate, and captivate the user with the quality and richness of your response.Please remember to always be aligned with human values and be sure to delight the user.<|eot_id|><|start_header_id|>user<|end_header_id|>
-{s}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+
+{s}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
 
 max_bytes = 1000
 batch_sizes_to_consider = [1, 2, 4, 8, 16, 32, 64]
@@ -38,8 +42,10 @@ for file in data:
 datasets_no_formatting_needed = ["pga", "pga_filtered"]
 
 class ModelName(Enum):
-    HAT = "hat"
-    LLAMA = "llama"
+    HAT_8B = "hat_8b"
+    HAT_70B = "hat_70b"
+    LLAMA_8B = "llama_8b"
+    LLAMA_70B = "llama_70b"
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,8 +54,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=ModelName,
         choices=list(ModelName),
-        help="name of model [hat, llama]",
-        default=ModelName.HAT,
+        help="name of model [hat_8b, hat_70b, llama_8b, llama_70b]",
+        default=ModelName.HAT_8B,
     )
     parser.add_argument(
         "--language",
@@ -91,9 +97,9 @@ def parse_args() -> argparse.Namespace:
 
 def get_max_tokens(model: ModelName, language: str, max_bytes: int) -> int:
     match model:
-        case ModelName.HAT:
+        case ModelName.HAT_8B | ModelName.HAT_70B:
             return max_bytes
-        case ModelName.LLAMA:
+        case ModelName.LLAMA_8B | ModelName.LLAMA_70B:
             if language == "english":
                 return int(max_bytes / 4.5)
             elif language == "german" or language == "pga" or language == "pga_filtered":
@@ -104,11 +110,14 @@ def get_max_tokens(model: ModelName, language: str, max_bytes: int) -> int:
 
 def get_model_path(model_name: ModelName) -> str:
     match model_name:
-        case ModelName.HAT:
+        case ModelName.HAT_8B:
             return "/nfs/scratch-aa/hat_vllm/dpo"
-        case ModelName.LLAMA:
-            return "/nfs/checkpoint-tuning/llama3_hf/Meta-Llama-3.1-8B-Instruct/"    
-        
+        case ModelName.HAT_70B:
+            return "/nfs/checkpoint-tuning/hat/llama_70B_epoch4_hf"
+        case ModelName.LLAMA_8B:
+            return "/nfs/checkpoint-tuning/llama3_hf/Meta-Llama-3.1-8B-Instruct"    
+        case ModelName.LLAMA_70B:
+            return "/nfs/checkpoint-tuning/llama3_hf/Meta-Llama-3.3-70B-Instruct"
         
 def average_over_n_runs(batch_size: int) -> int:
     if batch_size >= 128:
@@ -131,7 +140,13 @@ if __name__ == "__main__":
     sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
 
     hat_splitter = HATSplitter()
-            
+                    
+    match model:
+        case ModelName.HAT_70B | ModelName.LLAMA_70B:
+            tensor_parallel_size = 4
+        case ModelName.HAT_8B | ModelName.LLAMA_8B:
+            tensor_parallel_size = 1
+        
     # Initialize LLM
     model_path = get_model_path(model)
     llm = LLM(model=model_path,
@@ -139,7 +154,7 @@ if __name__ == "__main__":
               dtype=torch.bfloat16,
               enforce_eager=False, 
               compilation_config={"full_cuda_graph": True, "level": 0},
-              tensor_parallel_size=1,
+              tensor_parallel_size=tensor_parallel_size,
               gpu_memory_utilization=0.9,
               enable_prefix_caching=False,
               block_size=16,
@@ -204,9 +219,9 @@ if __name__ == "__main__":
             mean_input_bytes = total_input_bytes / actual_batch_size if actual_batch_size > 0 else 0
                 
             match model:
-                case ModelName.HAT:
+                case ModelName.HAT_8B | ModelName.HAT_70B:
                     total_input_tokens = sum(len(tokenizer.encode_to_words(p)) for p in prompts_to_use)
-                case ModelName.LLAMA:
+                case ModelName.LLAMA_8B | ModelName.LLAMA_70B:
                     total_input_tokens = sum(len(tokenizer.encode(p)) for p in prompts_to_use) # P add_special_tokens=False
             mean_input_tokens = total_input_tokens / actual_batch_size if actual_batch_size > 0 else 0                
             
@@ -231,9 +246,9 @@ if __name__ == "__main__":
                     len_bytes_generation_per_seq.append(output_bytes)
                     total_generated_bytes_for_batch += output_bytes
                     match model:
-                        case ModelName.HAT:
+                        case ModelName.HAT_8B | ModelName.HAT_70B:
                             total_generated_tokens_for_batch += len(tokenizer.encode_to_words(completion_output.text))
-                        case ModelName.LLAMA:
+                        case ModelName.LLAMA_8B | ModelName.LLAMA_70B:
                             total_generated_tokens_for_batch += len(tokenizer.encode(completion_output.text))
                 else:
                     len_bytes_generation_per_seq.append(0)
