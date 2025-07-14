@@ -32,6 +32,18 @@ def parse_args() -> argparse.Namespace:
         help="suffix to add to the output files",
         default="",
     )
+    parser.add_argument(
+        "--hat-json",
+        type=str,
+        help="Name of the HAT JSON file",
+        default="",
+    )
+    parser.add_argument(
+        "--llama-json",
+        type=str,
+        help="Name of the Llama JSON file",
+        default="",
+    )
     return parser.parse_args()
 
 def get_batch_size_from_filename(filename: str) -> int:
@@ -42,25 +54,7 @@ def get_batch_size_from_filename(filename: str) -> int:
     return 0
 
 
-def get_json_files_for_language_and_batch_size(language: str, batch_size: int) -> tuple[dict, dict]:
-    # We now read jsons from directory and see if we have enough information
-    # Find all json files that start with "benchmark_results_""
-    hat_json_files_all = glob.glob(f"benchmark_results_hat_{language}_maxbs*.json")
-    llama_json_files_all = glob.glob(f"benchmark_results_llama_{language}_maxbs*.json")
-    
-    hat_json_files = [f for f in hat_json_files_all if get_batch_size_from_filename(f) >= batch_size]
-    llama_json_files = [f for f in llama_json_files_all if get_batch_size_from_filename(f) >= batch_size]
-    
-    assert len(hat_json_files) >= 1, f"We do not have any json for HAT for language {language} and batch size >= {batch_size}"
-    assert len(llama_json_files) >= 1, f"We do not have any json for llama for language {language} and batch size >= {batch_size}"
-    
-    # We now select a file from the ones available
-    hat_json_file = max(hat_json_files, key=get_batch_size_from_filename)
-    llama_json_file = max(llama_json_files, key=get_batch_size_from_filename)
-    
-    print(f"Using HAT json file: {hat_json_file}")
-    print(f"Using llama json file: {llama_json_file}")
-
+def get_json_files(hat_json_file: str, llama_json_file: str) -> tuple[dict, dict]:
     with open(hat_json_file, "r") as f:
         hat_json = json.load(f)
         
@@ -75,7 +69,7 @@ if __name__ == "__main__":
     batch_size = args.batch_size
     print(f"Analyzing language: {language} with batch size: {batch_size}")
     
-    hat_json, llama_json = get_json_files_for_language_and_batch_size(language, batch_size)
+    hat_json, llama_json = get_json_files(args.hat_json, args.llama_json)
         
     # Get info for waterfall chart
     hat_bytes_per_s = hat_json[language][f"batch_size_{batch_size}"]["bytes_per_second"]

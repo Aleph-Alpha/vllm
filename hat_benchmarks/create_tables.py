@@ -21,34 +21,27 @@ def parse_args() -> argparse.Namespace:
         help="batch size to analyse",
         required=True,
     )
+    parser.add_argument(
+        "--hat-json",
+        type=str,
+        help="Name of the HAT JSON file",
+        default="",
+    )
+    parser.add_argument(
+        "--llama-json",
+        type=str,
+        help="Name of the Llama JSON file",
+        default="",
+    )
     return parser.parse_args()
-
-
-def find_benchmark_file(
-    directory: str, model_type: str, language: str
-) -> Optional[str]:
-    """Finds the benchmark file with the highest batch size for a given model and language."""
-    pattern = re.compile(f".*{model_type}.*{language}.*bs(\\d+).*.json")
-    files = []
-    for filename in os.listdir(directory):
-        match = pattern.match(filename)
-        if match:
-            batch_size = int(match.group(1))
-            files.append((batch_size, os.path.join(directory, filename)))
-
-    if not files:
-        return None
-
-    files.sort(key=lambda x: x[0], reverse=True)
-    return files[0][1]
 
 
 def main() -> None:
     args = parse_args()
     script_dir = os.path.dirname(os.path.realpath(__file__))
 
-    hat_file_path = find_benchmark_file(script_dir, "hat", args.language)
-    llama_file_path = find_benchmark_file(script_dir, "llama", args.language)
+    hat_file_path = args.hat_json
+    llama_file_path = args.llama_json
 
     if not hat_file_path:
         print(
