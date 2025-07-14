@@ -333,7 +333,8 @@ if __name__ == "__main__":
     
     # Save to JSON file
     system_prompt_used = "normal" if not args.long_system_prompt else "long"
-    json_filename = f"benchmark_results_{model.value}_{language}_maxbs{max_batch_size}_system_prompt_{system_prompt_used}_{heterogeneous}.json"
+    heterogeneous_str = "heterogeneous" if heterogeneous else "homogeneous"
+    json_filename = f"benchmark_results_{model.value}_{language}_maxbs{max_batch_size}_system_prompt_{system_prompt_used}_{heterogeneous_str}.json"
     with open(json_filename, 'w') as f:
         json.dump(json_results, f, indent=2)
     
