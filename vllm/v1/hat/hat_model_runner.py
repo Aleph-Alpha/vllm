@@ -8,12 +8,15 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import numpy as np
 import torch
 import torch.distributed
+from tqdm import tqdm
 
+import vllm.envs as envs
+from vllm.compilation.counter import compilation_counter
 from vllm.config import CompilationLevel, VllmConfig
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.parallel_state import (GraphCaptureContext, get_pp_group,
-                                             get_tp_group, graph_capture)
+                                             get_tp_group, graph_capture, is_global_first_rank)
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.hat import (HATBackboneForCausalLM,
@@ -56,6 +59,8 @@ class HATModelRunner(GPUModelRunner):
 
         self.attn_metadata_ex = None
         self.logits_indices_ex = None
+        self.attention_cuda_graphs_ex = None
+        self.num_scheduled_tokens_ex = None
         self.decoder_model_runner: Optional[HATModelRunner] = None
 
     def set_decoder_model_runner(
@@ -101,6 +106,7 @@ class HATModelRunner(GPUModelRunner):
             mm_inputs=new_req_data.mm_inputs,
             mm_positions=new_req_data.mm_positions,
             sampling_params=sampling_params,
+            pooling_params=new_req_data.pooling_params,
             generator=generator,
             block_ids=new_req_data.block_ids,
             num_computed_tokens=new_req_data.num_computed_tokens,
@@ -112,13 +118,18 @@ class HATModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> tuple[dict[str, Any], torch.Tensor, Optional[SpecDecodeMetadata]]:
+
+        for req_id in scheduler_output.finished_req_ids:
+            self.requests.pop(req_id, None)
+
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         self.input_batch.req_id_to_index = {}
         self.input_batch._req_ids = []
         self.input_batch.greedy_reqs = set()
         self.input_batch.random_reqs = set()
+        self.input_batch.block_table.clear()
 
-        idx = 0
+        row_idx = 0
         input_ids = []
         block_ids = []
         for sched_req in scheduler_output.scheduled_new_reqs:
@@ -138,6 +149,7 @@ class HATModelRunner(GPUModelRunner):
                     mm_inputs=sched_req.mm_inputs,
                     mm_positions=sched_req.mm_positions,
                     sampling_params=sched_req.sampling_params,
+                    pooling_params=sched_req.pooling_params,
                     generator=generator,
                     block_ids=block_ids,
                     num_computed_tokens=sched_req.num_computed_tokens,
@@ -150,69 +162,77 @@ class HATModelRunner(GPUModelRunner):
                 sched_req.req_id]
 
             prompt_token_ids = state.prompt_token_ids
-            self.input_batch.num_computed_tokens_cpu[idx] = 0
-            input_ids.extend(sched_req.prompt_token_ids[:num_scheduled_tokens])
+            self.input_batch.num_computed_tokens_cpu[row_idx] = 0
+            if self.role != HATSubmodelRole.BACKBONE:
+                input_ids.extend(sched_req.prompt_token_ids[:num_scheduled_tokens])
 
             sampling_params = state.sampling_params
             if sampling_params.sampling_type == SamplingType.GREEDY:
                 # Avoid later division by zero.
-                self.input_batch.temperature_cpu[idx] = -1.0
+                self.input_batch.temperature_cpu[row_idx] = -1.0
                 self.input_batch.greedy_reqs.add(sched_req.req_id)
             else:
                 self.input_batch.temperature_cpu[
-                    idx] = sampling_params.temperature
+                    row_idx] = sampling_params.temperature
                 self.input_batch.random_reqs.add(sched_req.req_id)
 
             self.input_batch._req_ids.append(sched_req.req_id)
-            self.input_batch.block_table.add_row(sched_req.block_ids, idx)
-            block_ids.extend(sched_req.block_ids)
-            self.input_batch.req_id_to_index[sched_req.req_id] = idx
-            idx += 1
+            self.input_batch.block_table.add_row(sched_req.block_ids, row_idx)
+            self.input_batch.req_id_to_index[sched_req.req_id] = row_idx
+            row_idx += 1
 
-        for sched_req in scheduler_output.scheduled_cached_reqs:
-            state = self.requests[sched_req.req_id]
-            num_new_tokens = scheduler_output.num_scheduled_tokens[
-                sched_req.req_id]
-            self.input_batch.num_computed_tokens_cpu[
-                idx] = sched_req.num_computed_tokens
-            input_ids.extend(sched_req.new_token_ids)
+        req_data = scheduler_output.scheduled_cached_reqs
+        for idx, req_id in enumerate(req_data.req_ids):
+            state = self.requests[req_id]
+            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            self.input_batch.num_computed_tokens_cpu[row_idx] = req_data.num_computed_tokens[idx]
+
+            num_computed_tokens = req_data.num_computed_tokens[idx]
+            if self.role != HATSubmodelRole.BACKBONE:
+                if num_new_tokens == 1:
+                    if num_computed_tokens >= state.num_prompt_tokens:
+                        input_ids.append(state.output_token_ids[num_computed_tokens - state.num_prompt_tokens])
+                    else:
+                        input_ids.append(state.prompt_token_ids[num_computed_tokens]) 
+                elif num_new_tokens > 1:
+                    if state.num_prompt_tokens > num_computed_tokens:
+                        offset_prompts = min(num_new_tokens, state.num_prompt_tokens - num_computed_tokens)
+                        input_ids.extend(state.prompt_token_ids[num_computed_tokens:num_computed_tokens + offset_prompts])
+                        offset_outputs = max(0, num_computed_tokens + num_new_tokens - state.num_prompt_tokens)
+                        if offset_outputs > 0:
+                            input_ids.extend(state.output_token_ids[:offset_outputs])
+                    else:
+                        start_pos = num_computed_tokens - state.num_prompt_tokens
+                        input_ids.extend(state.output_token_ids[start_pos:start_pos + num_new_tokens])
 
             sampling_params = state.sampling_params
             if sampling_params.sampling_type == SamplingType.GREEDY:
                 # Avoid later division by zero.
-                self.input_batch.temperature_cpu[idx] = -1.0
-                self.input_batch.greedy_reqs.add(sched_req.req_id)
+                self.input_batch.temperature_cpu[row_idx] = -1.0
+                self.input_batch.greedy_reqs.add(req_id)
             else:
                 self.input_batch.temperature_cpu[
-                    idx] = sampling_params.temperature
-                self.input_batch.random_reqs.add(sched_req.req_id)
+                    row_idx] = sampling_params.temperature
+                self.input_batch.random_reqs.add(req_id)
 
             if self.role != HATSubmodelRole.DECODER:
-                state.num_computed_tokens = sched_req.num_computed_tokens
-                num_new_tokens = (sched_req.num_computed_tokens +
-                                  num_new_tokens - state.num_tokens)
-                if num_new_tokens == 1:
-                    # Avoid slicing list in most common case.
-                    state.output_token_ids.append(sched_req.new_token_ids[-1])
-                elif num_new_tokens > 0:
-                    state.output_token_ids.extend(
-                        sched_req.new_token_ids[-num_new_tokens:])
+                state.num_computed_tokens = req_data.num_computed_tokens[idx]
 
-                if not sched_req.resumed_from_preemption:
+                if not req_data.resumed_from_preemption[idx]:
                     # Append the new blocks to the existing block IDs.
                     for i in range(len(self.kv_cache_config.kv_cache_groups)):
-                        state.block_ids[i].extend(sched_req.new_block_ids[i])
+                        state.block_ids[i].extend(req_data.new_block_ids[idx][i])
                 else:
                     # The request is resumed from preemption.
                     # Replace the existing block IDs with the new ones.
-                    state.block_ids = sched_req.new_block_ids
+                    state.block_ids = req_data.new_block_ids[idx]
 
-            self.input_batch._req_ids.append(sched_req.req_id)
-            self.input_batch.block_table.add_row(state.block_ids, idx)
-            self.input_batch.req_id_to_index[sched_req.req_id] = idx
-            idx += 1
+            self.input_batch._req_ids.append(req_id)
+            self.input_batch.block_table.add_row(state.block_ids, row_idx)
+            self.input_batch.req_id_to_index[req_id] = row_idx
+            row_idx += 1
 
-        self.input_batch.refresh_sampling_metadata()
+        self.input_batch.sampling_metadata = self.input_batch._make_sampling_metadata()
         input_ids = torch.tensor(input_ids, dtype=torch.int64).pin_memory()
 
         assert total_num_scheduled_tokens > 0
@@ -241,6 +261,11 @@ class HATModelRunner(GPUModelRunner):
 
         # Get positions.
         positions_np = self.positions_np[:total_num_scheduled_tokens]
+        #if self.role == HATSubmodelRole.ENCODER:
+        #    print("arange:", arange)
+        #    print("req_ids", req_ids)
+        #    print("req_indices:", req_indices)
+        #    print("num_computed_tokens_cpu:", self.input_batch.num_computed_tokens_cpu)
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
@@ -277,10 +302,11 @@ class HATModelRunner(GPUModelRunner):
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens)
 
-        # Copy the tensors to the GPU.
-        assert input_ids.shape[0] == total_num_scheduled_tokens
-        self.input_ids[:total_num_scheduled_tokens].copy_(input_ids,
-                                                          non_blocking=True)
+        if self.role != HATSubmodelRole.BACKBONE:
+            # Copy the tensors to the GPU.
+            assert input_ids.shape[0] == total_num_scheduled_tokens
+            self.input_ids[:total_num_scheduled_tokens].copy_(input_ids,
+                                                            non_blocking=True)
 
         # Common case (1D positions)
         self.positions[:total_num_scheduled_tokens].copy_(
@@ -299,7 +325,12 @@ class HATModelRunner(GPUModelRunner):
         seq_lens = self.seq_lens[:num_reqs]
 
         common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc, seq_lens=seq_lens)
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            num_reqs=num_reqs,
+            num_actual_tokens=total_num_scheduled_tokens,
+            max_query_len=max_num_scheduled_tokens,
+        )
 
         attn_metadata: dict[str, Any] = {}
         # Prepare the attention metadata for each KV cache group and make layers
@@ -309,6 +340,7 @@ class HATModelRunner(GPUModelRunner):
 
             # Prepare for cascade attention if enabled & beneficial.
             common_prefix_len = 0
+            builder = self.attn_metadata_builders[kv_cache_group_id]
             if self.cascade_attn_enabled:
                 common_prefix_len = self._compute_cascade_attn_prefix_len(
                     num_scheduled_tokens,
@@ -318,15 +350,17 @@ class HATModelRunner(GPUModelRunner):
                     self.attn_metadata_builders[kv_cache_group_id],
                 )
 
-            attn_metadata_i = (
-                self.attn_metadata_builders[kv_cache_group_id].build(
-                    num_reqs=num_reqs,
-                    num_actual_tokens=total_num_scheduled_tokens,
-                    max_query_len=max_num_scheduled_tokens,
-                    common_prefix_len=common_prefix_len,
-                    common_attn_metadata=common_attn_metadata))
+            attn_metadata_i = (builder.build(
+                common_prefix_len=common_prefix_len,
+                common_attn_metadata=common_attn_metadata,
+            ))
+
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
+
+        attention_cuda_graphs = all(
+            b.can_run_in_cudagraph(common_attn_metadata)
+            for b in self.attn_metadata_builders)
 
         # NOTE(woosuk): Due to chunked prefills, the batch may contain
         # partial requests. While we should not sample any token
@@ -338,10 +372,12 @@ class HATModelRunner(GPUModelRunner):
 
         if self.role == HATSubmodelRole.ENCODER:
             self.decoder_model_runner.attn_metadata_ex = attn_metadata_i
+            self.decoder_model_runner.attention_cuda_graphs_ex = attention_cuda_graphs
             self.decoder_model_runner.logits_indices_ex = logits_indices
+            self.decoder_model_runner.num_scheduled_tokens_ex = num_scheduled_tokens
             self.decoder_model_runner.requests = self.requests
 
-        return attn_metadata, logits_indices, spec_decode_metadata
+        return attn_metadata, attention_cuda_graphs, logits_indices, spec_decode_metadata, num_scheduled_tokens
 
     @torch.inference_mode()
     def execute_model(
@@ -360,9 +396,11 @@ class HATModelRunner(GPUModelRunner):
 
         if not prepare_inputs:
             attn_metadata = self.attn_metadata_ex
+            attention_cuda_graphs = self.attention_cuda_graphs_ex
             logits_indices = self.logits_indices_ex
+            num_scheduled_tokens_np = self.num_scheduled_tokens_ex
         else:
-            attn_metadata, logits_indices, _ = self._prepare_inputs(
+            attn_metadata, attention_cuda_graphs, logits_indices, _, num_scheduled_tokens_np = self._prepare_inputs(
                 scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -407,10 +445,26 @@ class HATModelRunner(GPUModelRunner):
         model_kwargs = self._get_model_kwargs(input_ids, positions,
                                               num_input_tokens,
                                               hat_batch_input, use_cuda_graph)
+        skip_cuda_graphs = self.full_cuda_graph and not attention_cuda_graphs
+        if self.role == HATSubmodelRole.BACKBONE:
+            block_table = attn_metadata[list(attn_metadata.keys())[0]].block_table
+            block_table = block_table[block_table != 0].tolist()
+            if len(block_table) != len(set(block_table)):
+                for new_reqs in scheduler_output.scheduled_new_reqs:
+                    print(new_reqs.req_id)
+                    print(self.requests[new_reqs.req_id].block_ids)
+                for idx, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
+                    state = self.requests[req_id]
+                    print(req_id)
+                    print(state.block_ids)
+                print(block_table)
+                exit()
+
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
-                                 num_tokens_across_dp=num_tokens_across_dp):
+                                 num_tokens_across_dp=num_tokens_across_dp,
+                                 skip_cuda_graphs=skip_cuda_graphs):
             self.maybe_setup_kv_connector(scheduler_output)
 
             if use_cuda_graph:
@@ -420,8 +474,6 @@ class HATModelRunner(GPUModelRunner):
                 model_output = self.model(**model_kwargs)
 
             self.maybe_wait_for_kv_save()
-            finished_sending, finished_recving = (
-                self.get_finished_kv_transfers(scheduler_output))
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -442,6 +494,7 @@ class HATModelRunner(GPUModelRunner):
             logits = None
         elif self.role == HATSubmodelRole.DECODER:
             sample_hidden_states = hidden_states[logits_indices]
+            #print("sample_hidden_states", sample_hidden_states)
             logits = self.model.compute_logits(sample_hidden_states, None)
         else:
             return hidden_states[:num_scheduled_tokens, :]
@@ -466,6 +519,10 @@ class HATModelRunner(GPUModelRunner):
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
+
+        num_nans_in_logits = {}
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            num_nans_in_logits = self._get_nans_in_logits(logits)
 
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
@@ -507,11 +564,12 @@ class HATModelRunner(GPUModelRunner):
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
-        spec_token_ids = None
+        for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests[req_id]
+            req_state.output_token_ids.extend(sampled_ids)
 
-        # Clear KVConnector state after all KVs are generated.
-        if has_kv_transfer_group():
-            get_kv_transfer_group().clear_connector_metadata()
+        spec_token_ids = None
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
@@ -520,8 +578,8 @@ class HATModelRunner(GPUModelRunner):
             spec_token_ids=spec_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
-            finished_sending=finished_sending,
-            finished_recving=finished_recving,
+            pooler_output=[],
+            num_nans_in_logits=num_nans_in_logits,
         )
 
     def _copy_cuda_graph_inputs(self, hat_batch_input: HATBatchInput,
@@ -543,7 +601,9 @@ class HATModelRunner(GPUModelRunner):
     def _dummy_run(
         self,
         num_tokens: int,
-        skip_attn: bool = True,
+        capture_attn_cudagraph: bool = False,
+        skip_eplb: bool = False,
+        is_profile: bool = False,
         create_input_tensors: bool = False,
     ) -> torch.Tensor:
 
@@ -565,9 +625,10 @@ class HATModelRunner(GPUModelRunner):
         num_scheduled_tokens = np.array(num_scheduled_tokens_list,
                                         dtype=np.int32)
 
-        if skip_attn:
-            attn_metadata: Optional[dict[str, Any]] = None
-        else:
+        attn_metadata: Optional[dict[str, Any]] = None
+        if capture_attn_cudagraph:
+            attn_metadata = {}
+
             query_start_loc = self.query_start_loc[:num_reqs + 1]
             # Make sure max_model_len is used at the graph capture time.
             self.seq_lens_np[:num_reqs] = self.max_model_len
@@ -577,19 +638,18 @@ class HATModelRunner(GPUModelRunner):
             seq_lens = self.seq_lens[:num_reqs]
 
             common_attn_metadata = CommonAttentionMetadata(
-                query_start_loc=query_start_loc, seq_lens=seq_lens)
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                max_query_len=num_tokens,
+            )
 
-            attn_metadata = {}
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
                     self.kv_cache_config.kv_cache_groups):
-                attn_metadata_i = (
-                    self.attn_metadata_builders[kv_cache_group_id].build(
-                        num_reqs=num_reqs,
-                        num_actual_tokens=num_tokens,
-                        max_query_len=num_tokens,
-                        common_prefix_len=0,
-                        common_attn_metadata=common_attn_metadata,
-                    ))
+                attn_metadata_i = self.attn_metadata_builders[
+                    kv_cache_group_id].build_for_cudagraph_capture(
+                        common_attn_metadata)
                 for layer_name in kv_cache_group_spec.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
 
@@ -673,19 +733,19 @@ class HATModelRunner(GPUModelRunner):
         seq_lens = self.seq_lens[:num_reqs]
 
         common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc, seq_lens=seq_lens)
+            query_start_loc=query_start_loc, 
+            seq_lens=seq_lens,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=num_tokens
+        )
 
         attn_metadata = {}
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
-            attn_metadata_i = (
-                self.attn_metadata_builders[kv_cache_group_id].build(
-                    num_reqs=num_reqs,
-                    num_actual_tokens=num_tokens,
-                    max_query_len=num_tokens,
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
-                ))
+            attn_metadata_i = self.attn_metadata_builders[
+                kv_cache_group_id].build_for_cudagraph_capture(
+                    common_attn_metadata)
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
@@ -745,6 +805,8 @@ class HATModelRunner(GPUModelRunner):
                 "-O %s to use CUDA graphs.", CompilationLevel.PIECEWISE)
             return
 
+        compilation_counter.num_gpu_runner_capture_triggers += 1
+
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
@@ -752,11 +814,19 @@ class HATModelRunner(GPUModelRunner):
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         with graph_capture(device=self.device) as graph_capture_context:
-            for num_tokens in reversed(self.cudagraph_batch_sizes):
+            full_cg = self.full_cuda_graph
+            # Only rank 0 should print progress bar during capture
+            compilation_cases = reversed(self.cudagraph_batch_sizes)
+            if is_global_first_rank():
+                compilation_cases = tqdm(
+                    list(compilation_cases),
+                    disable=not self.load_config.use_tqdm_on_load,
+                    desc="Capturing CUDA graph shapes")
+            for num_tokens in compilation_cases:
                 for _ in range(self.vllm_config.compilation_config.
                                cudagraph_num_of_warmups):
-                    self._dummy_run(num_tokens, skip_attn=False)
-                self._capture(num_tokens, graph_capture_context)
+                    self._dummy_run(num_tokens, capture_attn_cudagraph=full_cg)
+                self._capture(num_tokens, graph_capture_context=graph_capture_context)
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -828,6 +898,9 @@ class HATModelRunner(GPUModelRunner):
                           use_cuda_graph: bool = False) -> dict[str, Any]:
         match self.role:
             case HATSubmodelRole.ENCODER:
+                #print("INPUTS:", self.role)
+                #print("input_ids:", input_ids)
+                #print("positions:", positions)
                 model_kwargs = {
                     "input_ids": input_ids,
                     "inputs_embeds": None,
@@ -836,8 +909,10 @@ class HATModelRunner(GPUModelRunner):
             case HATSubmodelRole.BACKBONE:
                 previous_hidden_states = hat_batch_input.latent_word_embeddings
                 if use_cuda_graph:
-                    previous_hidden_states = self.previous_hidden_states[:
-                                                                         num_input_tokens, :]
+                    previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
+                #print("INPUTS:", self.role)
+                #print("previous_hidden_states:", previous_hidden_states)
+                #print("positions:", positions)
                 model_kwargs = {
                     "input_ids": None,
                     "inputs_embeds": None,
@@ -849,12 +924,14 @@ class HATModelRunner(GPUModelRunner):
                 predictive_word_embeddings = hat_batch_input.predictive_word_embeddings
                 word_lens_bytes = hat_batch_input.word_lens_bytes
                 if use_cuda_graph:
-                    previous_hidden_states = self.previous_hidden_states[:
-                                                                         num_input_tokens, :]
-                    predictive_word_embeddings = self.predictive_word_embeddings[:
-                                                                                 num_input_tokens, :]
+                    previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
+                    predictive_word_embeddings = self.predictive_word_embeddings[:num_input_tokens, :]
                     word_lens_bytes = None
-
+                #print("INPUTS:", self.role)
+                #print("previous_hidden_states:", previous_hidden_states)
+                #print("predictive_word_embeddings:", predictive_word_embeddings)
+                #print("word_lens_bytes:", word_lens_bytes)
+                #print("positions:", positions)
                 model_kwargs = {
                     # Reuse input_ids for word positions, because the decoder does not need input_ids
                     "input_ids": None,
@@ -864,6 +941,7 @@ class HATModelRunner(GPUModelRunner):
                     "predictive_word_embeddings": predictive_word_embeddings,
                     "previous_hidden_states": previous_hidden_states,
                 }
+        #print("\n\n\n")
         return model_kwargs
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:

@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput, CachedRequestData
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
@@ -26,8 +26,7 @@ class HATSequenceState:
     # Store bytes of the current word and first byte of new word
     curr_word_bytes: List[int]
     new_word_first_bytes: Optional[List[int]]
-    # For preemptions this includes previously computed decode tokens
-    num_prompt_tokens: int
+    all_token_ids: List[int]
 
     # These are updated for each step
     num_scheduled_tokens_backbone: int
@@ -106,7 +105,7 @@ class HATRequestType(str, Enum):
 def _create_empty_scheduler_output() -> SchedulerOutput:
     return SchedulerOutput(
         scheduled_new_reqs=[],
-        scheduled_cached_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={},
         total_num_scheduled_tokens=0,
         scheduled_spec_decode_tokens={},
@@ -127,6 +126,7 @@ def _create_empty_model_runner_output() -> ModelRunnerOutput:
                              spec_token_ids=None,
                              logprobs=None,
                              prompt_logprobs_dict={},
+                             pooler_output=[],
                              finished_sending=None,
                              finished_recving=None)
 

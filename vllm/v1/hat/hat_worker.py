@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 import dataclasses
+import gc
+import os
 from typing import List, Optional
 
 import torch
@@ -16,7 +18,8 @@ from vllm.distributed.parallel_state import (get_pp_group, get_tp_group,
 from vllm.logger import init_logger
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.utils import set_random_seed
-from vllm.utils import resolve_obj_by_qualname
+from vllm.platforms import current_platform
+from vllm.utils import resolve_obj_by_qualname, MemorySnapshot
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
@@ -26,9 +29,11 @@ from vllm.v1.hat.hat_utils import (BYTES_PER_WORKER_STEP,
                                    _reshape_kv_cache_tensors, safe_list_slice)
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
-from vllm.v1.utils import bind_kv_cache
-from vllm.v1.worker.gpu_worker import Worker
+from vllm.v1.utils import report_usage_stats
+from vllm.v1.worker.gpu_worker import Worker, _check_if_gpu_supports_dtype, init_worker_distributed_environment
+from vllm.v1.worker.utils import bind_kv_cache
 from vllm.v1.worker.worker_base import WorkerBase
+
 
 logger = init_logger(__name__)
 
@@ -42,6 +47,7 @@ def create_hat_worker(*args, **kwargs):
         "vllm.model_executor.models.hat:HATBackboneForCausalLM")
 
     vllm_config: VllmConfig = kwargs.get("vllm_config")
+    vllm_config.model_config.disable_cascade_attn = True
     encoder_worker = _create_worker(
         vllm_config.model_config.hf_config.encoder_config,
         "HATEncoderForCausalLM", *args, **kwargs)
@@ -109,6 +115,10 @@ class HATWorker(WorkerBase):
         else:
             self.profiler = None
 
+    def initialize_cache(self, num_gpu_blocks: int,
+                         num_cpu_blocks: int) -> None:
+        pass        
+
     def init_device(self) -> None:
         self.backbone_worker.init_device()
         self.backbone_worker.load_model()
@@ -141,6 +151,7 @@ class HATWorker(WorkerBase):
 
     def determine_available_memory(self) -> int:
         available_memory = self.backbone_worker.determine_available_memory()
+        #return 2e9
         return available_memory
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -254,11 +265,13 @@ class HATWorker(WorkerBase):
             scheduler_output)
         encoder_hidden_states = self.encoder_worker.execute_model(
             scheduler_output_byte)
+        #print("encoder_hidden_states", encoder_hidden_states)
 
         encoder_hidden_states_phases, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte,
                                                    encoder_hidden_states))
 
+        predictive_word_embeddings = None
         if self._has_scheduled_requests(scheduler_output_word):
             self.stream_backbone.wait_stream(self.default_stream)
             self.stream_backbone.wait_stream(self.stream_enc_dec)
@@ -266,11 +279,15 @@ class HATWorker(WorkerBase):
                 predictive_word_embeddings = self.run_backbone(
                     scheduler_output_word, encoder_hidden_states_phases.
                     encoder_hidden_states_encoder_connector)
+                self.hat_manager.update_backbone_info_prefill_path(
+                    scheduler_output_word)
+                #print(predictive_word_embeddings)
+        
+        if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
+            with torch.cuda.stream(self.stream_backbone):
                 predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(
                     scheduler_output_byte_final_decoder,
                     predictive_word_embeddings)
-                self.hat_manager.update_backbone_info_prefill_path(
-                    scheduler_output_word)
 
         both_paths_active = self._has_scheduled_requests(
             scheduler_output_byte_enc_dec) and self._has_scheduled_requests(
@@ -285,6 +302,8 @@ class HATWorker(WorkerBase):
 
         if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
             with torch.cuda.stream(self.stream_backbone):
+                self.stream_backbone.wait_stream(self.default_stream)
+                self.stream_backbone.wait_stream(self.stream_enc_dec)
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(
                     scheduler_output_byte_final_decoder)
 
@@ -299,12 +318,12 @@ class HATWorker(WorkerBase):
                     hat_batch_input_final_decoder,
                     prepare_inputs=both_paths_active)
 
-                scheduled_cached_reqs_dec_word_boundary = safe_list_slice(
-                    scheduler_output_byte_final_decoder.scheduled_cached_reqs,
+                scheduled_cached_reqs_dec_word_boundary_req_ids = safe_list_slice(
+                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids,
                     self.hat_manager.num_decodes_word_boundary,
                     keep_prefix=False)
                 self.hat_manager.process_outputs_enc_dec_loop(
-                    scheduled_cached_reqs_dec_word_boundary,
+                    scheduled_cached_reqs_dec_word_boundary_req_ids,
                     model_runner_output,
                     decode_path=False)
                 self.hat_manager.process_outputs_prefill_chunked_prefill(
@@ -318,7 +337,7 @@ class HATWorker(WorkerBase):
                     scheduler_output_word_decodes)
                 self.hat_manager.update_backbone_info_decode_path(
                     predictive_word_embeddings)
-
+        
         return self.hat_manager.finish_step()
 
     def run_backbone(
@@ -348,8 +367,8 @@ class HATWorker(WorkerBase):
         model_runner_output = self.decoder_worker.execute_model(
             scheduler_output, hat_batch_input, prepare_inputs=prepare_inputs)
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(
-            scheduler_output.scheduled_cached_reqs, model_runner_output)
-        num_decodes_running = len(scheduler_output.scheduled_cached_reqs)
+            scheduler_output.scheduled_cached_reqs.req_ids, model_runner_output)
+        num_decodes_running = len(scheduler_output.scheduled_cached_reqs.req_ids)
 
         process_full_word = num_decodes_running <= LIMIT_FOR_STATIC_STEPS
 
@@ -370,9 +389,9 @@ class HATWorker(WorkerBase):
             model_runner_output = self.decoder_worker.execute_model(
                 scheduler_output, hat_batch_input, prepare_inputs=False)
             scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(
-                scheduler_output.scheduled_cached_reqs, model_runner_output)
+                scheduler_output.scheduled_cached_reqs.req_ids, model_runner_output)
             bytes_processed += 1
-            num_decodes_running = len(scheduler_output.scheduled_cached_reqs)
+            num_decodes_running = len(scheduler_output.scheduled_cached_reqs.req_ids)
 
     def _handle_empty_scheduler_output(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
@@ -391,7 +410,7 @@ class HATWorker(WorkerBase):
     def _has_scheduled_requests(self,
                                 scheduler_output: SchedulerOutput) -> bool:
         return bool(scheduler_output.scheduled_new_reqs
-                    or scheduler_output.scheduled_cached_reqs)
+                    or scheduler_output.scheduled_cached_reqs.req_ids)
 
     @property
     def rank(self):
@@ -444,6 +463,51 @@ class HATModelWorker(Worker):
             return None
 
         return output
+
+    def init_device(self):
+        if self.device_config.device.type == "cuda":
+            # torch.distributed.all_reduce does not free the input tensor until
+            # the synchronization point. This causes the memory usage to grow
+            # as the number of all_reduce calls increases. This env var disables
+            # this behavior.
+            # Related issue:
+            # https://discuss.pytorch.org/t/cuda-allocation-lifetime-for-inputs-to-distributed-all-reduce/191573
+            os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+
+            # This env var set by Ray causes exceptions with graph building.
+            os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            current_platform.set_device(self.device)
+
+            _check_if_gpu_supports_dtype(self.model_config.dtype)
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            self.init_snapshot = MemorySnapshot()
+            self.requested_memory = (self.init_snapshot.total_memory *
+                                     self.cache_config.gpu_memory_utilization)
+            # Maybe add a memory check as done in the gpu worker specialized for HAT
+        else:
+            raise RuntimeError(
+                f"Not support device type: {self.device_config.device}")
+        # Initialize the distributed environment.
+        init_worker_distributed_environment(self.vllm_config, self.rank,
+                                            self.distributed_init_method,
+                                            self.local_rank,
+                                            current_platform.dist_backend)
+        # Set random seed.
+        set_random_seed(self.model_config.seed)
+
+        if self.model_runner_cls is None:
+            self.model_runner = GPUModelRunner(
+                self.vllm_config, self.device)
+        else:
+            self.model_runner = self.model_runner_cls(
+                self.vllm_config, self.device)
+
+        if self.rank == 0:
+            # If usage stat is enabled, collect relevant info.
+            report_usage_stats(self.vllm_config)
 
     def compile_or_warm_up_model(self, run_sampler: bool = False) -> None:
         # warm up sizes that are not in cudagraph capture sizes,

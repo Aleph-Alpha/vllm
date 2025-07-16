@@ -2346,12 +2346,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_table_i,
             )
 
-            if (self.full_cuda_graph
-                    and not attn_metadata_builder_i.full_cudagraph_supported):
-                raise ValueError(
-                    f"Full CUDAGraph not supported for "
-                    f"{attn_backend_i.__name__}. Turn off CompilationConfig."
-                    f"full_cuda_graph or use a different attention backend.")
+            #if (self.full_cuda_graph
+            #        and not attn_metadata_builder_i.full_cudagraph_supported):
+            #    raise ValueError(
+            #        f"Full CUDAGraph not supported for "
+            #        f"{attn_backend_i.__name__}. Turn off CompilationConfig."
+            #        f"full_cuda_graph or use a different attention backend.")
 
             self.attn_backends.append(attn_backend_i)
             self.attn_metadata_builders.append(attn_metadata_builder_i)

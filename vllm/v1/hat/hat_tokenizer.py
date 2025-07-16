@@ -113,7 +113,7 @@ class HATTokenizer(TokenizerBase):
         truncation: bool = False,
         max_length: Optional[int] = None,
     ) -> List[int]:
-        input_ids = self.encode(text)
+        input_ids = self.encode(text, truncation, max_length)
 
         if truncation:
             input_ids = input_ids[:max_length]
@@ -121,8 +121,14 @@ class HATTokenizer(TokenizerBase):
 
     def encode(self,
                text: str,
+               truncation: Optional[bool] = False,
+               max_length: Optional[int] = None,
                add_special_tokens: Optional[bool] = None) -> List[int]:
-        return self.hat_splitter.encode_to_flattened(text)
+        input_ids = self.hat_splitter.encode_to_flattened(text)
+
+        if truncation:
+            input_ids = input_ids[:max_length]
+        return input_ids
 
     def encode_to_words(self, text: str) -> List[List[int]]:
         return self.hat_splitter.encode(text)

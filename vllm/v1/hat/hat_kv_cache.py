@@ -6,11 +6,11 @@ from typing import Callable, Dict, List, Optional
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils import sha256
+from vllm.utils import sha256, sha256_cbor_64bit
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock, init_none_hash
 from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager, get_manager_for_kv_cache_spec)
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
@@ -39,7 +39,10 @@ class HATKVCacheManager(KVCacheManager):
         self.max_model_len = max_model_len
 
         self.enable_caching = enable_caching
-        self.caching_hash_fn = sha256 if caching_hash_algo == "sha256" else hash
+        self.caching_hash_fn = (
+            sha256_cbor_64bit if caching_hash_algo == "sha256_cbor_64bit" else
+            sha256 if caching_hash_algo == "sha256" else hash)
+        init_none_hash(self.caching_hash_fn)
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         # FIXME: make prefix cache stats conditional on log_stats
@@ -161,15 +164,9 @@ class HATKVCacheManager(KVCacheManager):
 
         else:
             if len(request._all_token_ids) - request.num_computed_tokens == 1:
-                num_new_tokens = len(
-                    request._all_token_ids) - self.req_id_to_hat_info[
-                        request.request_id].num_computed_tokens_byte
-            start_idx = self.req_id_to_hat_info[
-                request.
-                request_id].num_computed_tokens_byte - self.req_id_to_hat_info[
-                    request.request_id].num_curr_word_bytes
-            offset = num_new_tokens + self.req_id_to_hat_info[
-                request.request_id].num_curr_word_bytes
+                num_new_tokens = len(request._all_token_ids) - self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte
+            start_idx = self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte - self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
+            offset = num_new_tokens + self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
             words = split_text(
                 self.hat_splitter,
                 request._all_token_ids[start_idx:start_idx + offset])
@@ -230,6 +227,7 @@ class HATKVCacheManager(KVCacheManager):
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
+            del self.req_id_to_hat_info[request.request_id]
             return None
 
         # Touch the computed blocks to make sure they won't be evicted.
@@ -270,7 +268,8 @@ class HATKVCacheManager(KVCacheManager):
         Args:
             request: The request to free the blocks.
         """
-        del self.req_id_to_hat_info[request.request_id]
+        if request.request_id in self.req_id_to_hat_info:
+            del self.req_id_to_hat_info[request.request_id]
         self.coordinator.free(request.request_id)
 
 
@@ -293,25 +292,22 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
 
         self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
                                     enable_kv_cache_events)
-        self.single_type_managers: list[SingleTypeKVCacheManager] = []
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
 
-        for i in range(len(self.kv_cache_config.kv_cache_groups)):
-            kv_cache_spec = self.kv_cache_config.kv_cache_groups[
-                i].kv_cache_spec
-            self.single_type_managers.append(
-                get_manager_for_kv_cache_spec(
-                    kv_cache_spec=kv_cache_spec,
-                    block_pool=self.block_pool,
-                    kv_cache_group_id=i,
-                    caching_hash_fn=caching_hash_fn,
-                ))
+        self.single_type_managers = tuple(
+            get_manager_for_kv_cache_spec(
+                kv_cache_spec=kv_cache_group.kv_cache_spec,
+                block_pool=self.block_pool,
+                kv_cache_group_id=i,
+                caching_hash_fn=caching_hash_fn,
+            ) for i, kv_cache_group in enumerate(
+                self.kv_cache_config.kv_cache_groups))
 
     def get_num_blocks_to_allocate(
             self, request_id: str, num_tokens: List[int],
-            new_computed_blocks: list[list[KVCacheBlock]]) -> int:
+            new_computed_blocks: tuple[list[KVCacheBlock]]) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
 
@@ -332,7 +328,7 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
         return num_blocks_to_allocate
 
     def allocate_new_blocks(self, request_id: str,
-                            num_tokens: List[int]) -> list[list[KVCacheBlock]]:
+                            num_tokens: List[int]) -> tuple[list[KVCacheBlock]]:
         """
         Allocate new blocks for the request to give it at least `num_tokens` 
         token slots.
