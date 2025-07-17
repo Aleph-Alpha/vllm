@@ -15,7 +15,7 @@ class Encoding:
     input_ids: Union[List[int], List[List[int]]]
 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class HATTokenizer(TokenizerBase):
 
     def __init__(self, special_token_dict: Dict[str, int]):

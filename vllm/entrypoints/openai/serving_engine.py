@@ -76,6 +76,7 @@ from vllm.tracing import (contains_trace_headers, extract_trace_headers,
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.utils import (AsyncMicrobatchTokenizer, is_list_of,
                         merge_async_iterators, random_uuid)
+from vllm.v1.hat.hat_tokenizer import HATTokenizer
 
 logger = init_logger(__name__)
 
@@ -906,7 +907,11 @@ class OpenAIServing:
             request = tool_parser(tokenizer).adjust_request(  # type: ignore
                 request=request)
 
-        if isinstance(request_prompt, str):
+        if isinstance(tokenizer, HATTokenizer):
+            prompt_inputs = TextTokensPrompt(
+                prompt=request_prompt,
+                prompt_token_ids=tokenizer.encode(request_prompt))
+        elif isinstance(request_prompt, str):
             prompt_inputs = await self._tokenize_prompt_input_async(
                 request,
                 tokenizer,
