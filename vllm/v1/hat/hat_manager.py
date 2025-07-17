@@ -150,14 +150,16 @@ class HATManager:
                     req_state.num_scheduled_tokens_backbone = num_scheduled_tokens_backbone
                     if num_scheduled_tokens_backbone > 0:
                         scheduler_output_word.scheduled_cached_reqs.req_ids.append(req_id)
-                        scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(cached_reqs.resumed_from_preemption[idx])
+                        scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(cached_reqs.resumed_from_preemption[idx] or req_state.is_small_chunked_prefill_after_preemption)
                         scheduler_output_word.scheduled_cached_reqs.new_block_ids.append(block_table_backbone)
-                        scheduler_output_word.scheduled_cached_reqs.num_computed_tokens.append(self.req_ids_to_hat_state[req_id].word_position_cpu)
+                        scheduler_output_word.scheduled_cached_reqs.num_computed_tokens.append(req_state.word_position_cpu)
                         scheduler_output_word.num_scheduled_tokens[
                             req_id] = num_scheduled_tokens_backbone
                         scheduler_output_word.total_num_scheduled_tokens += num_scheduled_tokens_backbone
+                        
+                        req_state.is_small_chunked_prefill_after_preemption = False
                     else:
-                        print(block_table_backbone)
+                        req_state.is_small_chunked_prefill_after_preemption = True
 
                 case (HATRequestType.DECODE_WORD_BOUNDARY, _):
                     self.req_ids_to_hat_state[req_id].word_lens_bytes = [1]
@@ -169,10 +171,11 @@ class HATManager:
                     else:
                         req_state.block_table_backbone = block_table_backbone
 
-                    decodes_word_boundary.append((req_id, block_table_enc_dec))
+                    decodes_word_boundary.append((req_id, block_table_enc_dec, req_state.is_small_chunked_prefill_after_preemption))
                     # Update scheduler_output_word
                     scheduler_output_word.num_scheduled_tokens[req_id] = 1
                     scheduler_output_word.total_num_scheduled_tokens += 1
+                    req_state.is_small_chunked_prefill_after_preemption = False
 
                 case (HATRequestType.DECODE, _):
                     if len(req_state.block_table_backbone) > 0:
@@ -188,15 +191,15 @@ class HATManager:
                 case _:
                     raise ValueError(
                         f"Invalid request type: {req_state.request_type}")
-
-        for req_id, block_table_enc_dec in decodes_word_boundary:
+                    
+        for req_id, block_table_enc_dec, is_small_chunked_prefill_after_preemption in decodes_word_boundary:
             scheduler_output_byte.scheduled_cached_reqs.req_ids.append(req_id)
             scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption.append(False)
             scheduler_output_byte.scheduled_cached_reqs.new_block_ids.append(block_table_enc_dec)
             scheduler_output_byte.scheduled_cached_reqs.num_computed_tokens.append(self.req_ids_to_hat_state[req_id].byte_position)
 
             scheduler_output_word.scheduled_cached_reqs.req_ids.append(req_id)
-            scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(False)
+            scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(is_small_chunked_prefill_after_preemption)
             scheduler_output_word.scheduled_cached_reqs.new_block_ids.append(self.req_ids_to_hat_state[req_id].block_table_backbone)
             scheduler_output_word.scheduled_cached_reqs.num_computed_tokens.append(self.req_ids_to_hat_state[req_id].word_position_cpu)
 
@@ -745,9 +748,10 @@ class HATManager:
                     self.scheduler_output_word_decodes.total_num_scheduled_tokens += 1
 
                     self.scheduler_output_word_decodes.scheduled_cached_reqs.req_ids.append(req_id)
-                    self.scheduler_output_word_decodes.scheduled_cached_reqs.resumed_from_preemption.append(False)
+                    self.scheduler_output_word_decodes.scheduled_cached_reqs.resumed_from_preemption.append(req_state.is_small_chunked_prefill_after_preemption)
                     self.scheduler_output_word_decodes.scheduled_cached_reqs.new_block_ids.append(req_state.block_table_backbone)
                     self.scheduler_output_word_decodes.scheduled_cached_reqs.num_computed_tokens.append(req_state.word_position_cpu)
+                    req_state.is_small_chunked_prefill_after_preemption = False
 
                 if words:
                     req_state.curr_word_bytes = words[0]
@@ -827,6 +831,7 @@ class HATManager:
             word_position_cpu=torch.tensor(0, dtype=torch.int64),
             byte_position=0,
             request_type=request_type,
+            is_small_chunked_prefill_after_preemption=False,
         )
         return num_scheduled_tokens_backbone
 
@@ -878,6 +883,7 @@ class HATManager:
             word_position_cpu=torch.tensor(0, dtype=torch.int64),
             byte_position=0,
             request_type=request_type,
+            is_small_chunked_prefill_after_preemption=False,
         )
         return num_scheduled_tokens_backbone
 

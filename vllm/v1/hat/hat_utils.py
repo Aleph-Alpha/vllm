@@ -51,6 +51,15 @@ class HATSequenceState:
     byte_position: int
 
     request_type: "HATRequestType"
+    
+    # Edge case: A sequence that resumes from preemption with a small chunked prefill 
+    # (less than a full word). 
+    # The scheduler sets `resumed_from_preemption` only on the  very first resumption 
+    # of the sequence. If the first received chunk after resumption is less than a full 
+    # word, the backbone ModelRunner isn't called, so it won't know that the sequence 
+    # was resumed from preemption.
+    # This flag identifies such scenarios.
+    is_small_chunked_prefill_after_preemption: bool
 
 
 @dataclass
