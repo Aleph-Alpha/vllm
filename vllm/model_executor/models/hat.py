@@ -100,8 +100,7 @@ class HATAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=rope_scaling["is_neox_style"]
-            if "is_neox_style" in rope_scaling else True,
+            is_neox_style=config.is_neox_style,
         )
 
         self.attn = Attention(
@@ -206,8 +205,7 @@ class HATCrossAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=rope_scaling["is_neox_style"]
-            if "is_neox_style" in rope_scaling else True,
+            is_neox_style=config.is_neox_style,
         )
 
     def forward(

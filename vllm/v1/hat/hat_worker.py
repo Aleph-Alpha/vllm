@@ -151,8 +151,7 @@ class HATWorker(WorkerBase):
 
     def determine_available_memory(self) -> int:
         available_memory = self.backbone_worker.determine_available_memory()
-        return 2e9
-        #return available_memory
+        return available_memory
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
