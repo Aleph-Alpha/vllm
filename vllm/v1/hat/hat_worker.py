@@ -261,11 +261,12 @@ class HATWorker(WorkerBase):
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
 
+        self.default_stream.wait_stream(self.stream_backbone)
+        self.default_stream.wait_stream(self.stream_enc_dec)
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(
             scheduler_output)
         encoder_hidden_states = self.encoder_worker.execute_model(
             scheduler_output_byte)
-        #print("encoder_hidden_states", encoder_hidden_states)
 
         encoder_hidden_states_phases, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte,
@@ -281,7 +282,6 @@ class HATWorker(WorkerBase):
                     encoder_hidden_states_encoder_connector)
                 self.hat_manager.update_backbone_info_prefill_path(
                     scheduler_output_word)
-                #print(predictive_word_embeddings)
         
         if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
             with torch.cuda.stream(self.stream_backbone):

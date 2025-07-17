@@ -843,7 +843,7 @@ class HATManager:
         """
         req_state = self.req_ids_to_hat_state[req_id]
 
-        text_words_bytes = split_text(self.hat_splitter, req_state.all_token_ids[:num_scheduled_tokens])
+        text_words_bytes = split_text(self.hat_splitter, req_state.all_token_ids)
 
         word_lens_bytes = [
             len(text_word_bytes) for text_word_bytes in text_words_bytes

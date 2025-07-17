@@ -276,7 +276,6 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
-                    print("PREEMPTED", preempted_req.request_id, "TRIED", request.request_id)
                     if self.log_stats:
                         preempted_req.record_event(
                             EngineCoreEventType.PREEMPTED, scheduled_timestamp)
@@ -450,8 +449,6 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                print("\n\n")
-                print("TRY WAITING REQUEST", request.request_id, request.status)
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,

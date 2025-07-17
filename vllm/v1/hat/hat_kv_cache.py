@@ -230,17 +230,11 @@ class HATKVCacheManager(KVCacheManager):
             new_computed_blocks=new_computed_block_list,
         )
 
-        if num_blocks_to_allocate:
-            print("Allocated", num_blocks_to_allocate, "blocks")
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             if copy_state is not None:
-                print("Tried", request.request_id, "but failed")
-                print("Copying state", copy_state)
                 self.req_id_to_hat_info[request.request_id] = copy_state
             else:
-                print("Tried", request.request_id, "but failed")
-                print("Deleting state")
                 del self.req_id_to_hat_info[request.request_id]
             return None
 

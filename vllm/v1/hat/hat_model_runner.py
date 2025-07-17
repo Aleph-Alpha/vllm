@@ -225,13 +225,6 @@ class HATModelRunner(GPUModelRunner):
                     # The request is resumed from preemption.
                     # Replace the existing block IDs with the new ones.
                     state.block_ids = req_data.new_block_ids[idx]
-            if self.role == HATSubmodelRole.BACKBONE and len(state.block_ids[0]) * 16 < state.num_computed_tokens + num_new_tokens:
-                print(req_id)
-                print(self.role)
-                print(len(state.block_ids[0]) * 16)
-                print(state.num_computed_tokens)
-                print(num_new_tokens)
-                exit()
 
             self.input_batch._req_ids.append(req_id)
             self.input_batch.block_table.add_row(state.block_ids, row_idx)
@@ -267,11 +260,6 @@ class HATModelRunner(GPUModelRunner):
 
         # Get positions.
         positions_np = self.positions_np[:total_num_scheduled_tokens]
-        #if self.role == HATSubmodelRole.ENCODER:
-        #    print("arange:", arange)
-        #    print("req_ids", req_ids)
-        #    print("req_indices:", req_indices)
-        #    print("num_computed_tokens_cpu:", self.input_batch.num_computed_tokens_cpu)
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
@@ -486,7 +474,6 @@ class HATModelRunner(GPUModelRunner):
             logits = None
         elif self.role == HATSubmodelRole.DECODER:
             sample_hidden_states = hidden_states[logits_indices]
-            #print("sample_hidden_states", sample_hidden_states)
             logits = self.model.compute_logits(sample_hidden_states, None)
         else:
             return hidden_states[:num_scheduled_tokens, :]
@@ -890,9 +877,6 @@ class HATModelRunner(GPUModelRunner):
                           use_cuda_graph: bool = False) -> dict[str, Any]:
         match self.role:
             case HATSubmodelRole.ENCODER:
-                #print("INPUTS:", self.role)
-                #print("input_ids:", input_ids)
-                #print("positions:", positions)
                 model_kwargs = {
                     "input_ids": input_ids,
                     "inputs_embeds": None,
@@ -902,9 +886,6 @@ class HATModelRunner(GPUModelRunner):
                 previous_hidden_states = hat_batch_input.latent_word_embeddings
                 if use_cuda_graph:
                     previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
-                #print("INPUTS:", self.role)
-                #print("previous_hidden_states:", previous_hidden_states)
-                #print("positions:", positions)
                 model_kwargs = {
                     "input_ids": None,
                     "inputs_embeds": None,
@@ -919,11 +900,6 @@ class HATModelRunner(GPUModelRunner):
                     previous_hidden_states = self.previous_hidden_states[:num_input_tokens, :]
                     predictive_word_embeddings = self.predictive_word_embeddings[:num_input_tokens, :]
                     word_lens_bytes = None
-                #print("INPUTS:", self.role)
-                #print("previous_hidden_states:", previous_hidden_states)
-                #print("predictive_word_embeddings:", predictive_word_embeddings)
-                #print("word_lens_bytes:", word_lens_bytes)
-                #print("positions:", positions)
                 model_kwargs = {
                     # Reuse input_ids for word positions, because the decoder does not need input_ids
                     "input_ids": None,
@@ -933,7 +909,6 @@ class HATModelRunner(GPUModelRunner):
                     "predictive_word_embeddings": predictive_word_embeddings,
                     "previous_hidden_states": previous_hidden_states,
                 }
-        #print("\n\n\n")
         return model_kwargs
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:

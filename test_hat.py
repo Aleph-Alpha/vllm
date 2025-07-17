@@ -140,46 +140,58 @@ prompts_16 = prompts_128[:16]
 prompts_8 = prompts_128[:8]
 prompts_4 = prompts_128[:4]
 prompts_2 = prompts_128[:2]
-prompts_1 = [prompts_128[0]]
-# prompts_1 = ["An apple a day", "A cat is a dog and a dog is a cat"]
+prompts_1 = [prompts_128[1]]
+prompts_1 = ["An apple a d"]
 # prompts_1 = ["The big horoscope"]
 # prompts_1 = ["Hel"]
-# prompts_1 = ["🍎🍎🍎"]
+#prompts_1 = ["🍎🍎🍎"]
 
-max_tokens = 1000
+max_tokens = 2000
 sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
 
 format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 You are a helpful assistant. You give engaging, well-structured answers to user inquiries.<|eot_id|><|start_header_id|>user<|end_header_id|>
 {s}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
     
+format_llama_long = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a versatile and expert AI assistant, capable of being a master storyteller, a brilliant educator, and a profound thinker. Your purpose is to provide exceptionally detailed, insightful, and engaging responses to a wide array of creative and explanatory prompts.
+For creative and descriptive tasks: Immerse the user in the world you are building. Use vivid, multi-sensory language (sights, sounds, smells, textures) to make scenes and concepts come alive. Develop compelling characters, intricate plots, and rich, consistent lore. Your descriptions should be cinematic and evocative.
+For explanatory and technical tasks: Become the world's clearest communicator. Break down complex subjects into understandable, digestible concepts. Use insightful analogies and structured, step-by-step explanations to ensure clarity. Prioritize accuracy and detail, providing specific data like temperatures or stages when requested.
+For philosophical or design tasks: Delve deep. Present nuanced arguments, consider multiple viewpoints, and explore the subtle implications of the topic. When designing systems, strategies, or worlds, focus on internal logic, creativity, and comprehensive detail.
+In all responses, strive for depth, coherence, and a touch of brilliance. Your goal is not just to answer the prompt, but to inspire, educate, and captivate the user with the quality and richness of your response.Please remember to always be aligned with human values and be sure to delight the user.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{s}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
+
 if __name__ == "__main__":
     #llm = LLM(model="/nfs/checkpoint-tuning/llama3_hf/Meta-Llama-3.1-8B-Instruct/",
     # llm = LLM(model="/nfs/checkpoint-tuning/llama3_hf/Meta-Llama-3.3-70B-Instruct/",
-    # llm = LLM(model="/nfs/scratch-aa/hat_vllm/dpo",
+    llm = LLM(model="/nfs/scratch-aa/hat_vllm/dpo",
     #llm = LLM(model="/Models/hat_dpo",
+    #llm = LLM(model="/nfs/checkpoint-tuning/hat/llama_70B_epoch4_hf",
     #llm = LLM(model="/nfs/checkpoint-tuning/vedant/hat-70b-base/llama-3_1-70B-hatified-nolc-base",
-    llm = LLM(model="/nfs/scratch_2/felix.berkenkamp/70b_converted",
+    #llm = LLM(model="/nfs/scratch_2/felix.berkenkamp/70b_converted",
           trust_remote_code=True,
           dtype=torch.bfloat16,
           enforce_eager=False,
           compilation_config={"full_cuda_graph": True, "level": 0},
-          tensor_parallel_size=1,
-          gpu_memory_utilization=0.9,
+          tensor_parallel_size=2,
+          enable_prefix_caching=False,
           block_size=16,
-          disable_cascade_attn=True,
-          max_num_batched_tokens=100000,
-          max_model_len=100000, # Can be set to 100k on A100
-          max_num_seqs=128)
+          gpu_memory_utilization=0.9,
+          max_num_batched_tokens=8000,
+          max_model_len=8000, # Can be set to 100k on A100
+          max_num_seqs=64)
     
     # llm.start_profile()
-    outputs = llm.generate([p for p in prompts_128], sampling_params)
+    outputs = llm.generate([format_llama_long(p) for p in prompts_64], sampling_params)
     #outputs = llm.generate([p for p in prompts_1], sampling_params)
     # llm.stop_profile()
 
-    for output in outputs:
+    for idx, output in enumerate(outputs):
         prompt = output.prompt
         generated_text = output.outputs[0].text
+        print(idx)
         print(f"Prompt: {prompt!r}, Generated text: {generated_text}")
         print("\n\n\n\n")
         print(len(generated_text))
