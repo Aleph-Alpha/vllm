@@ -127,7 +127,6 @@ class HATModelRunner(GPUModelRunner):
         self.input_batch._req_ids = []
         self.input_batch.greedy_reqs = set()
         self.input_batch.random_reqs = set()
-        self.input_batch.block_table.clear()
 
         row_idx = 0
         input_ids = []
@@ -226,6 +225,13 @@ class HATModelRunner(GPUModelRunner):
                     # The request is resumed from preemption.
                     # Replace the existing block IDs with the new ones.
                     state.block_ids = req_data.new_block_ids[idx]
+            if self.role == HATSubmodelRole.BACKBONE and len(state.block_ids[0]) * 16 < state.num_computed_tokens + num_new_tokens:
+                print(req_id)
+                print(self.role)
+                print(len(state.block_ids[0]) * 16)
+                print(state.num_computed_tokens)
+                print(num_new_tokens)
+                exit()
 
             self.input_batch._req_ids.append(req_id)
             self.input_batch.block_table.add_row(state.block_ids, row_idx)
@@ -446,20 +452,6 @@ class HATModelRunner(GPUModelRunner):
                                               num_input_tokens,
                                               hat_batch_input, use_cuda_graph)
         skip_cuda_graphs = self.full_cuda_graph and not attention_cuda_graphs
-        if self.role == HATSubmodelRole.BACKBONE:
-            block_table = attn_metadata[list(attn_metadata.keys())[0]].block_table
-            block_table = block_table[block_table != 0].tolist()
-            if len(block_table) != len(set(block_table)):
-                for new_reqs in scheduler_output.scheduled_new_reqs:
-                    print(new_reqs.req_id)
-                    print(self.requests[new_reqs.req_id].block_ids)
-                for idx, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
-                    state = self.requests[req_id]
-                    print(req_id)
-                    print(state.block_ids)
-                print(block_table)
-                exit()
-
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,

@@ -144,6 +144,7 @@ class HATKVCacheManager(KVCacheManager):
 
         req_id = request.request_id
         new_slots_needed_backbone = 0
+        copy_state = None
         if req_id not in self.req_id_to_hat_info:
             self.req_id_to_hat_info[req_id] = HATKVCacheState(
                 num_curr_word_bytes=0,
@@ -163,6 +164,10 @@ class HATKVCacheManager(KVCacheManager):
                 request.request_id].num_computed_tokens_byte = num_new_tokens
 
         else:
+            copy_state = HATKVCacheState(
+                num_curr_word_bytes=self.req_id_to_hat_info[request.request_id].num_curr_word_bytes,
+                num_computed_tokens_backbone=self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone,
+                num_computed_tokens_byte=self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte)
             if len(request._all_token_ids) - request.num_computed_tokens == 1:
                 num_new_tokens = len(request._all_token_ids) - self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte
             start_idx = self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte - self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
@@ -225,9 +230,18 @@ class HATKVCacheManager(KVCacheManager):
             new_computed_blocks=new_computed_block_list,
         )
 
+        if num_blocks_to_allocate:
+            print("Allocated", num_blocks_to_allocate, "blocks")
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
-            del self.req_id_to_hat_info[request.request_id]
+            if copy_state is not None:
+                print("Tried", request.request_id, "but failed")
+                print("Copying state", copy_state)
+                self.req_id_to_hat_info[request.request_id] = copy_state
+            else:
+                print("Tried", request.request_id, "but failed")
+                print("Deleting state")
+                del self.req_id_to_hat_info[request.request_id]
             return None
 
         # Touch the computed blocks to make sure they won't be evicted.
