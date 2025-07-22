@@ -127,6 +127,7 @@ class HATModelRunner(GPUModelRunner):
         self.input_batch._req_ids = []
         self.input_batch.greedy_reqs = set()
         self.input_batch.random_reqs = set()
+        max_num_logprobs = -1
 
         row_idx = 0
         input_ids = []
@@ -175,6 +176,9 @@ class HATModelRunner(GPUModelRunner):
                     row_idx] = sampling_params.temperature
                 self.input_batch.random_reqs.add(sched_req.req_id)
 
+            if sampling_params.logprobs is not None:
+                max_num_logprobs = max(max_num_logprobs, sampling_params.logprobs)
+
             self.input_batch._req_ids.append(sched_req.req_id)
             self.input_batch.block_table.add_row(sched_req.block_ids, row_idx)
             self.input_batch.req_id_to_index[sched_req.req_id] = row_idx
@@ -213,6 +217,9 @@ class HATModelRunner(GPUModelRunner):
                 self.input_batch.temperature_cpu[
                     row_idx] = sampling_params.temperature
                 self.input_batch.random_reqs.add(req_id)
+                
+            if sampling_params.logprobs is not None:
+                max_num_logprobs = max(max_num_logprobs, sampling_params.logprobs)
 
             if self.role != HATSubmodelRole.DECODER:
                 state.num_computed_tokens = req_data.num_computed_tokens[idx]
@@ -232,6 +239,7 @@ class HATModelRunner(GPUModelRunner):
             row_idx += 1
 
         self.input_batch.sampling_metadata = self.input_batch._make_sampling_metadata()
+        self.input_batch.sampling_metadata.max_num_logprobs = max_num_logprobs if max_num_logprobs != -1 else None
         input_ids = torch.tensor(input_ids, dtype=torch.int64).pin_memory()
 
         assert total_num_scheduled_tokens > 0

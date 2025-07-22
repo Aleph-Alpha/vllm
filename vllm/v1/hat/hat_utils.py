@@ -10,7 +10,7 @@ from vllm.attention.backends.abstract import AttentionBackend
 from vllm.v1.core.sched.output import SchedulerOutput, CachedRequestData
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 
 # Constants
 
@@ -133,7 +133,7 @@ def _create_empty_model_runner_output() -> ModelRunnerOutput:
                              req_id_to_index={},
                              sampled_token_ids=[],
                              spec_token_ids=None,
-                             logprobs=None,
+                             logprobs=LogprobsLists(logprob_token_ids=[], logprobs=[], sampled_token_ranks=[]),
                              prompt_logprobs_dict={},
                              pooler_output=[],
                              finished_sending=None,
@@ -288,3 +288,10 @@ def _reshape_kv_cache_tensors(
             else:
                 raise NotImplementedError
     return kv_caches
+
+
+def convert_byte_ids_to_hex(token_ids: List[int]) -> List[str]:
+    """
+    Convert byte IDs to hex strings.
+    """
+    return [hex(token_id) for token_id in token_ids]

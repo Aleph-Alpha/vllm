@@ -634,8 +634,7 @@ class HATManager:
 
             self.output.req_id_to_index[req_id] = len(self.output.req_ids)
             self.output.req_ids.append(req_id)
-            self.output.sampled_token_ids.append([])
-            self.output.prompt_logprobs_dict[req_id] = None
+            self.output.prompt_logprobs_dict[req_id] = model_runner_output.prompt_logprobs_dict.get(req_id)
 
             new_token_id = None
             
@@ -650,7 +649,12 @@ class HATManager:
                     int] = model_runner_output.sampled_token_ids[
                         req_id_index_step]
                 new_token_id = sampled_token_ids[0]
-                self.output.sampled_token_ids[-1].append(new_token_id)
+                self.output.sampled_token_ids.append([new_token_id])
+                
+                if model_runner_output.logprobs is not None:
+                    self.output.logprobs.logprob_token_ids.append(model_runner_output.logprobs.logprob_token_ids[req_id_index_step])
+                    self.output.logprobs.logprobs.append(model_runner_output.logprobs.logprobs[req_id_index_step])
+                    self.output.logprobs.sampled_token_ranks.append(model_runner_output.logprobs.sampled_token_ranks[req_id_index_step])
 
                 req_state.request_type = HATRequestType.DECODE
 
@@ -715,7 +719,11 @@ class HATManager:
                         req_id_index_step]
                 new_token_id = sampled_token_ids[0]
                 self.output.sampled_token_ids.append([new_token_id])
-                self.output.prompt_logprobs_dict[req_id] = None
+                
+                if model_runner_output.logprobs is not None:
+                    self.output.logprobs.logprob_token_ids.append(model_runner_output.logprobs.logprob_token_ids[req_id_index_step])
+                    self.output.logprobs.logprobs.append(model_runner_output.logprobs.logprobs[req_id_index_step])
+                    self.output.logprobs.sampled_token_ranks.append(model_runner_output.logprobs.sampled_token_ranks[req_id_index_step])
             else:
                 # self.output.req_id_to_index contains info for all seqs in this worker step
                 # model_runner_output only contains info about seq currently running in the loop
@@ -725,9 +733,14 @@ class HATManager:
                 sampled_token_ids: List[
                     int] = model_runner_output.sampled_token_ids[
                         req_id_index_step]
-                new_token_id = sampled_token_ids[-1]
+                new_token_id = sampled_token_ids[0]
                 self.output.sampled_token_ids[req_id_index_output].append(
                     new_token_id)
+                
+                if model_runner_output.logprobs is not None:
+                    self.output.logprobs.logprob_token_ids[req_id_index_output].append(model_runner_output.logprobs.logprob_token_ids[req_id_index_step][0])
+                    self.output.logprobs.logprobs[req_id_index_output].append(model_runner_output.logprobs.logprobs[req_id_index_step][0])
+                    self.output.logprobs.sampled_token_ranks[req_id_index_output].append(model_runner_output.logprobs.sampled_token_ranks[req_id_index_step][0])
 
             req_state.byte_position += 1
             curr_word_bytes = req_state.curr_word_bytes

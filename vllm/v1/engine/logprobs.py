@@ -11,6 +11,8 @@ from vllm.sequence import Logprob, PromptLogprobs, SampleLogprobs
 from vllm.transformers_utils.detokenizer_utils import (
     AnyTokenizer, convert_ids_list_to_tokens)
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
+from vllm.v1.hat.hat_tokenizer import HATTokenizer
+from vllm.v1.hat.hat_utils import convert_byte_ids_to_hex
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
 logger = init_logger(__name__)
@@ -68,26 +70,32 @@ class LogprobsProcessor:
 
         token_ids_lst, logprobs_lst, ranks_lst = logprobs_lists
 
-        for rank, logprobs, token_ids in zip(ranks_lst, logprobs_lst,
-                                             token_ids_lst):
+        # Iterate over requests (typically just 1 from slice)
+        for req_token_ids, req_logprobs, req_ranks in zip(token_ids_lst, logprobs_lst, ranks_lst):
+            # Iterate over generated tokens within this request
+            for token_ids, logprobs, rank in zip(req_token_ids, req_logprobs, req_ranks):
+                
+                if self.tokenizer is None:
+                    decoded_tokens = NONES
+                elif isinstance(self.tokenizer, HATTokenizer):
+                    decoded_tokens = convert_byte_ids_to_hex(token_ids)
+                else:
+                    # Detokenize (non-incrementally).
+                    decoded_tokens = convert_ids_list_to_tokens(self.tokenizer, token_ids)
 
-            # Detokenize (non-incrementally).
-            decoded_tokens = NONES if self.tokenizer is None else (
-                convert_ids_list_to_tokens(self.tokenizer, token_ids))
+                # Sampler puts the sampled logprob in first.
+                sampled_token_logprob = logprobs[0]
+                self.cumulative_logprob += sampled_token_logprob
 
-            # Sampler puts the sampled logprob in first.
-            sampled_token_logprob = logprobs[0]
-            self.cumulative_logprob += sampled_token_logprob
-
-            # Update with the Logprob dictionary for this pos.
-            self.logprobs.append(
-                self._make_logprob_dict(
-                    logprobs,
-                    token_ids,
-                    decoded_tokens,
-                    rank,
-                    self.num_logprobs,
-                ))
+                # Update with the Logprob dictionary for this pos.
+                self.logprobs.append(
+                    self._make_logprob_dict(
+                        logprobs,
+                        token_ids,
+                        decoded_tokens,
+                        rank,
+                        self.num_logprobs,
+                    ))
 
     def _update_prompt_logprobs(
         self,

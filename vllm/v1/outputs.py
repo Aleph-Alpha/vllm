@@ -9,12 +9,12 @@ import torch
 
 class LogprobsLists(NamedTuple):
 
-    # [num_reqs, max_num_logprobs + 1]
-    logprob_token_ids: list[list[int]]
-    # [num_reqs, max_num_logprobs + 1]
-    logprobs: list[list[float]]
-    # [num_reqs]
-    sampled_token_ranks: list[int]
+    # [num_reqs, num_generated_tokens, max_num_logprobs + 1]
+    logprob_token_ids: list[list[list[int]]]
+    # [num_reqs, num_generated_tokens, max_num_logprobs + 1]
+    logprobs: list[list[list[float]]]
+    # [num_reqs, num_generated_tokens]
+    sampled_token_ranks: list[list[int]]
 
     def slice(self, start: int, end: int):
         return LogprobsLists(
@@ -35,9 +35,9 @@ class LogprobsTensors(NamedTuple):
 
     def tolists(self):
         return LogprobsLists(
-            self.logprob_token_ids.tolist(),
-            self.logprobs.tolist(),
-            self.selected_token_ranks.tolist(),
+            self.logprob_token_ids.unsqueeze(1).tolist(),
+            self.logprobs.unsqueeze(1).tolist(),
+            self.selected_token_ranks.unsqueeze(1).tolist(),
         )
 
     @staticmethod
@@ -90,9 +90,9 @@ class ModelRunnerOutput:
     # num_reqs x num_spec_tokens
     spec_token_ids: Optional[list[list[int]]]
 
-    # [num_reqs, max_num_logprobs + 1]
-    # [num_reqs, max_num_logprobs + 1]
-    # [num_reqs]
+    # [num_reqs, num_generated_tokens, max_num_logprobs + 1]
+    # [num_reqs, num_generated_tokens, max_num_logprobs + 1]
+    # [num_reqs, num_generated_tokens]
     logprobs: Optional[LogprobsLists]
 
     # req_id -> (token_ids, logprobs, ranks)
