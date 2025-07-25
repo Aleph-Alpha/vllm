@@ -8,6 +8,7 @@
 
 ARG CUDA_VERSION=12.8.1
 ARG PYTHON_VERSION=3.12
+ARG VLLM_DATETIMESTAMP
 
 # By parameterizing the base images, we allow third-party to use their own
 # base images. One use case is hermetic builds with base images stored in
@@ -71,6 +72,7 @@ ARG INSTALL_KV_CONNECTORS=false
 FROM ${BUILD_BASE_IMAGE} AS base
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
+ARG VLLM_DATETIMESTAMP
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ENV DEBIAN_FRONTEND=noninteractive

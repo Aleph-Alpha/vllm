@@ -589,6 +589,13 @@ def get_vllm_version() -> str:
     else:
         raise RuntimeError("Unknown runtime environment")
 
+    # Append custom timestamp label if provided
+    timestamp_label = os.getenv("VLLM_DATETIMESTAMP")
+    if timestamp_label:
+        # ensure safe separator and no illegal chars
+        sep = "+" if "+" not in version else "."
+        version += f"{sep}{timestamp_label.lower()}"
+
     return version
 
 
@@ -661,6 +668,7 @@ if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
 
 if _build_custom_ops():
+    print("########################### Building custom ops \n\n\n\n\n")
     ext_modules.append(CMakeExtension(name="vllm._C"))
 
 package_data = {

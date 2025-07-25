@@ -1,0 +1,81 @@
+# name: Build with Docker and Publish to GitLab
+
+# on:
+#   push:
+#     tags:              # only publish on version tags such as v0.4.2
+#       - 'v*'
+#   workflow_dispatch:   # manual trigger
+
+# permissions:           # needed for twine → GitHub Packages
+#   contents: read
+#   packages: write
+
+# jobs:
+#   build-and-publish:
+#     name: Build (CUDA ${{ matrix.cuda_version }}) and Publish
+#     runs-on: cpu-runner-16c-64gb-01
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         include:
+#           - cuda_version: "12.8.1"
+#             torch_cuda_arch_list: "" # Let Docker use its default for this version
+#           #- cuda_version: "12.6.3"
+#           #  torch_cuda_arch_list: "7.0 7.5 8.0 8.9 9.0+PTX"
+
+#     steps:
+#       - name: Checkout repository
+#         uses: actions/checkout@v4
+
+#       - name: Set up Docker Buildx
+#         uses: docker/setup-buildx-action@v2
+
+#       - name: Generate build label
+#         id: buildlabel
+#         run: |
+#           TS=$(date -u +%Y%m%d%H%M%S)
+#           echo "VLLM_DATETIMESTAMP=${TS}" >> "$GITHUB_ENV"
+
+#       - name: Build wheel inside Docker
+#         env:
+#           VLLM_DATETIMESTAMP: ${{ env.VLLM_DATETIMESTAMP }}
+#         uses: docker/build-push-action@v4
+#         with:
+#           context: .
+#           file: ./docker/Dockerfile
+#           build-args: |
+#             USE_SCCACHE=0
+#             GIT_REPO_CHECK=0
+#             CUDA_VERSION=${{ matrix.cuda_version }}
+#             torch_cuda_arch_list=${{ matrix.torch_cuda_arch_list }}
+#             VLLM_DATETIMESTAMP=${{ env.VLLM_DATETIMESTAMP }}
+#           tags: vllm-build-container:${{ matrix.cuda_version }}
+#           load: true
+#           push: false
+#           targets: build
+#           # cache-from: type=local,src=/tmp/.buildx-cache
+#           # cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
+
+#       - name: Extract wheels from Docker container
+#         run: |
+#           mkdir -p dist
+#           docker run --rm -v $(pwd)/dist:/dist_host vllm-build-container:${{ matrix.cuda_version }} bash -c 'cp -r dist/* /dist_host'
+
+#       - name: Set up Python for Twine
+#         uses: actions/setup-python@v4
+#         with:
+#           python-version: '3.12'
+
+#       - name: Install Twine
+#         run: python -m pip install --upgrade twine
+
+#       - name: Publish package to GitLab Registry
+#         env:
+#           TWINE_USERNAME: ${{ secrets.GITLAB_DEPLOY_TOKEN_USERNAME }}
+#           TWINE_PASSWORD: ${{ secrets.GITLAB_DEPLOY_TOKEN }}
+#           REPO_URL: ${{ secrets.GITLAB_API_URL }}/projects/${{ secrets.GITLAB_PROJECT_ID }}/packages/pypi
+#         run: |
+#           python -m twine upload --verbose --repository-url "$REPO_URL" dist/*
+
+#       - name: Clean up Docker image
+#         run: docker rmi vllm-build-container:${{ matrix.cuda_version }} || true
