@@ -332,6 +332,8 @@ class repackage_wheel(build_ext):
     def run(self) -> None:
         assert _is_cuda(
         ), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
+        print(f"########################### _is_cuda(): {_is_cuda()}")
+        print(f"########################### _need_precompiled_cuda_kernels(): {_need_precompiled_cuda_kernels()}")
 
         wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
         if wheel_location is None:
@@ -392,6 +394,7 @@ class repackage_wheel(build_ext):
             file_members += list(
                 filter(lambda x: compiled_regex.match(x.filename),
                        wheel.filelist))
+            print(f"########################### file_members: {file_members}")
 
             for file in file_members:
                 print(f"Extracting and including {file.filename} "
@@ -402,12 +405,25 @@ class repackage_wheel(build_ext):
                 if package_name not in package_data:
                     package_data[package_name] = []
 
-                wheel.extract(file)
+                # Extract to the correct package directory structure
+                extracted_path = wheel.extract(file)
+                target_dir = os.path.dirname(file.filename)
+                if not os.path.exists(target_dir):
+                    os.makedirs(target_dir, exist_ok=True)
+                
+                # Move the extracted file to the correct location
+                target_path = file.filename
+                if extracted_path != target_path:
+                    import shutil
+                    shutil.move(extracted_path, target_path)
+                
                 if file_name.endswith(".py"):
                     # python files shouldn't be added to package_data
                     continue
 
                 package_data[package_name].append(file_name)
+
+            print(f"########################### final package_data: {package_data}")
 
 
 def _is_hpu() -> bool:
@@ -441,6 +457,11 @@ def _is_cuda() -> bool:
     has_cuda = torch.version.cuda is not None
     return (VLLM_TARGET_DEVICE == "cuda" and has_cuda
             and not (_is_neuron() or _is_tpu() or _is_hpu()))
+
+
+def _need_precompiled_cuda_kernels() -> bool:
+    """Returns True if we want to keep precompiled CUDA kernels when buildingon CPU runners"""
+    return envs.VLLM_USE_PRECOMPILED and VLLM_TARGET_DEVICE == "cuda"
 
 
 def _is_hip() -> bool:
@@ -689,7 +710,7 @@ else:
         "build_ext":
         repackage_wheel if envs.VLLM_USE_PRECOMPILED else cmake_build_ext
     }
-
+print(f"########################### ext_modules: {ext_modules}")
 setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
