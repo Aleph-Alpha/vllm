@@ -1,6 +1,9 @@
-from vllm import LLM, SamplingParams
-import torch
-import traceback
+allowed_hat_models = [
+    "Aleph-Alpha/llama-3_1-8b-tfree-hat-dpo",
+    "Aleph-Alpha/llama-3_1-8b-tfree-hat-sft",
+    "Aleph-Alpha/llama-3_1-8b-tfree-hat-base",
+    "Aleph-Alpha/llama-3_1-70b-tfree-hat-sft"
+]
 
 prompts_128 = [
     "Describe in vivid detail a bustling marketplace in a fantasy city, focusing on sights, sounds, and smells. ",
@@ -133,44 +136,3 @@ prompts_128 = [
     "Imagine a library that contains every book ever written, and every book that ever will be written.",
     "Develop a story about a group of scientists who discover a portal to a parallel universe.",
 ]
-
-prompts_64 = prompts_128[:64]
-prompts_32 = prompts_128[:32]
-prompts_16 = prompts_128[:16]
-prompts_8 = prompts_128[:8]
-prompts_4 = prompts_128[:4]
-prompts_2 = prompts_128[:2]
-prompts_1 = [prompts_128[0]]
-
-max_tokens = 5000
-sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=max_tokens)
-
-format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-You are a helpful assistant. You give engaging, well-structured answers to user inquiries.<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-{s}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
-    
-if __name__ == "__main__":
-    llm = LLM(model="/nfs/scratch-aa/hat_vllm/dpo",
-    #llm = LLM(model="/nfs/checkpoint-tuning/hat/llama_70B_epoch4_hf",
-          trust_remote_code=True,
-          dtype=torch.bfloat16,
-          enforce_eager=False,
-          compilation_config={"full_cuda_graph": True, "level": 0},
-          tensor_parallel_size=1,
-          gpu_memory_utilization=0.9,
-          max_num_batched_tokens=200000,
-          max_num_seqs=128)
-    
-    # llm.start_profile()
-    outputs = llm.generate([format_llama(p) for p in prompts_2], sampling_params)
-    # llm.stop_profile()
-
-    for idx, output in enumerate(outputs):
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(idx)
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text}")
-        print("\n\n\n\n")
-        print(len(generated_text))
