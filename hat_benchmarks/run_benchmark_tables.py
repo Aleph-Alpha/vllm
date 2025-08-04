@@ -1,16 +1,17 @@
-from vllm import LLM, SamplingParams
-import torch
-import time
-import numpy as np
-import sys
-import os
-from hat_splitter import HATSplitter
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
-from enum import Enum
-import json
-import os
-from typing import Dict, List
 import glob
+import json
+import time
+from enum import Enum
+from typing import Dict, List
+
+import numpy as np
+import torch
+from hat_splitter import HATSplitter
+
+from vllm import LLM, SamplingParams
 
 format_llama = lambda s: f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
@@ -36,7 +37,7 @@ data = glob.glob("language_prompts*.json")
 dict_language_to_prompts: Dict[str, List[str]] = {}
 
 for file in data:
-    with open(file, "r") as f:
+    with open(file) as f:
         dict_language_to_prompts.update(json.load(f))
                 
 datasets_no_formatting_needed = ["pga", "pga_filtered"]

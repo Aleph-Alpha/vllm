@@ -3,7 +3,6 @@
 import itertools
 import re
 from abc import ABC, abstractmethod
-from typing import Optional
 
 from hat_splitter import HATSplitter as Splitter
 

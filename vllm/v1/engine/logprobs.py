@@ -71,17 +71,20 @@ class LogprobsProcessor:
         token_ids_lst, logprobs_lst, ranks_lst = logprobs_lists
 
         # Iterate over requests (typically just 1 from slice)
-        for req_token_ids, req_logprobs, req_ranks in zip(token_ids_lst, logprobs_lst, ranks_lst):
+        for req_token_ids, req_logprobs, req_ranks in zip(
+                token_ids_lst, logprobs_lst, ranks_lst):
             # Iterate over generated tokens within this request
-            for token_ids, logprobs, rank in zip(req_token_ids, req_logprobs, req_ranks):
-                
+            for token_ids, logprobs, rank in zip(req_token_ids, req_logprobs,
+                                                 req_ranks):
+
                 if self.tokenizer is None:
                     decoded_tokens = NONES
                 elif isinstance(self.tokenizer, HATTokenizer):
                     decoded_tokens = convert_byte_ids_to_hex(token_ids)
                 else:
                     # Detokenize (non-incrementally).
-                    decoded_tokens = convert_ids_list_to_tokens(self.tokenizer, token_ids)
+                    decoded_tokens = convert_ids_list_to_tokens(
+                        self.tokenizer, token_ids)
 
                 # Sampler puts the sampled logprob in first.
                 sampled_token_logprob = logprobs[0]

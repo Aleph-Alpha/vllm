@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.core.sched.output import SchedulerOutput, CachedRequestData
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
@@ -51,12 +51,12 @@ class HATSequenceState:
     byte_position: int
 
     request_type: "HATRequestType"
-    
-    # Edge case: A sequence that resumes from preemption with a small chunked prefill 
-    # (less than a full word). 
-    # The scheduler sets `resumed_from_preemption` only on the  very first resumption 
-    # of the sequence. If the first received chunk after resumption is less than a full 
-    # word, the backbone ModelRunner isn't called, so it won't know that the sequence 
+
+    # Edge case: A sequence that resumes from preemption with a small chunked prefill
+    # (less than a full word).
+    # The scheduler sets `resumed_from_preemption` only on the  very first resumption
+    # of the sequence. If the first received chunk after resumption is less than a full
+    # word, the backbone ModelRunner isn't called, so it won't know that the sequence
     # was resumed from preemption.
     # This flag identifies such scenarios.
     is_small_chunked_prefill_after_preemption: bool
@@ -133,7 +133,9 @@ def _create_empty_model_runner_output() -> ModelRunnerOutput:
                              req_id_to_index={},
                              sampled_token_ids=[],
                              spec_token_ids=None,
-                             logprobs=LogprobsLists(logprob_token_ids=[], logprobs=[], sampled_token_ranks=[]),
+                             logprobs=LogprobsLists(logprob_token_ids=[],
+                                                    logprobs=[],
+                                                    sampled_token_ranks=[]),
                              prompt_logprobs_dict={},
                              pooler_output=[],
                              finished_sending=None,

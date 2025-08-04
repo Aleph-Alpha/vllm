@@ -332,9 +332,6 @@ class repackage_wheel(build_ext):
     def run(self) -> None:
         assert _is_cuda(
         ), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
-        print(f"########################### _is_cuda(): {_is_cuda()}")
-        print(f"########################### _need_precompiled_cuda_kernels(): {_need_precompiled_cuda_kernels()}")
-
         wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
         if wheel_location is None:
             base_commit = self.get_base_commit_in_main_branch()
@@ -394,11 +391,8 @@ class repackage_wheel(build_ext):
             file_members += list(
                 filter(lambda x: compiled_regex.match(x.filename),
                        wheel.filelist))
-            print(f"########################### file_members: {file_members}")
 
             for file in file_members:
-                print(f"Extracting and including {file.filename} "
-                      "from existing wheel")
                 package_name = os.path.dirname(file.filename).replace("/", ".")
                 file_name = os.path.basename(file.filename)
 
@@ -410,20 +404,18 @@ class repackage_wheel(build_ext):
                 target_dir = os.path.dirname(file.filename)
                 if not os.path.exists(target_dir):
                     os.makedirs(target_dir, exist_ok=True)
-                
+
                 # Move the extracted file to the correct location
                 target_path = file.filename
                 if extracted_path != target_path:
                     import shutil
                     shutil.move(extracted_path, target_path)
-                
+
                 if file_name.endswith(".py"):
                     # python files shouldn't be added to package_data
                     continue
 
                 package_data[package_name].append(file_name)
-
-            print(f"########################### final package_data: {package_data}")
 
 
 def _is_hpu() -> bool:
@@ -689,7 +681,6 @@ if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
 
 if _build_custom_ops():
-    print("########################### Building custom ops \n\n\n\n\n")
     ext_modules.append(CMakeExtension(name="vllm._C"))
 
 package_data = {
@@ -710,7 +701,6 @@ else:
         "build_ext":
         repackage_wheel if envs.VLLM_USE_PRECOMPILED else cmake_build_ext
     }
-print(f"########################### ext_modules: {ext_modules}")
 setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),

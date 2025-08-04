@@ -19,7 +19,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.utils import set_random_seed
 from vllm.platforms import current_platform
-from vllm.utils import resolve_obj_by_qualname, MemorySnapshot
+from vllm.utils import MemorySnapshot, resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
@@ -30,10 +30,10 @@ from vllm.v1.hat.hat_utils import (BYTES_PER_WORKER_STEP,
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_worker import Worker, _check_if_gpu_supports_dtype, init_worker_distributed_environment
+from vllm.v1.worker.gpu_worker import (Worker, _check_if_gpu_supports_dtype,
+                                       init_worker_distributed_environment)
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm.v1.worker.worker_base import WorkerBase
-
 
 logger = init_logger(__name__)
 
@@ -117,7 +117,7 @@ class HATWorker(WorkerBase):
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
-        pass        
+        pass
 
     def init_device(self) -> None:
         self.backbone_worker.init_device()
@@ -281,7 +281,7 @@ class HATWorker(WorkerBase):
                     encoder_hidden_states_encoder_connector)
                 self.hat_manager.update_backbone_info_prefill_path(
                     scheduler_output_word)
-        
+
         if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
             with torch.cuda.stream(self.stream_backbone):
                 predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(
@@ -318,7 +318,8 @@ class HATWorker(WorkerBase):
                     prepare_inputs=both_paths_active)
 
                 scheduled_cached_reqs_dec_word_boundary_req_ids = safe_list_slice(
-                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids,
+                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.
+                    req_ids,
                     self.hat_manager.num_decodes_word_boundary,
                     keep_prefix=False)
                 self.hat_manager.process_outputs_enc_dec_loop(
@@ -336,7 +337,7 @@ class HATWorker(WorkerBase):
                     scheduler_output_word_decodes)
                 self.hat_manager.update_backbone_info_decode_path(
                     predictive_word_embeddings)
-        
+
         return self.hat_manager.finish_step()
 
     def run_backbone(
@@ -366,8 +367,10 @@ class HATWorker(WorkerBase):
         model_runner_output = self.decoder_worker.execute_model(
             scheduler_output, hat_batch_input, prepare_inputs=prepare_inputs)
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(
-            scheduler_output.scheduled_cached_reqs.req_ids, model_runner_output)
-        num_decodes_running = len(scheduler_output.scheduled_cached_reqs.req_ids)
+            scheduler_output.scheduled_cached_reqs.req_ids,
+            model_runner_output)
+        num_decodes_running = len(
+            scheduler_output.scheduled_cached_reqs.req_ids)
 
         process_full_word = num_decodes_running <= LIMIT_FOR_STATIC_STEPS
 
@@ -388,9 +391,11 @@ class HATWorker(WorkerBase):
             model_runner_output = self.decoder_worker.execute_model(
                 scheduler_output, hat_batch_input, prepare_inputs=False)
             scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(
-                scheduler_output.scheduled_cached_reqs.req_ids, model_runner_output)
+                scheduler_output.scheduled_cached_reqs.req_ids,
+                model_runner_output)
             bytes_processed += 1
-            num_decodes_running = len(scheduler_output.scheduled_cached_reqs.req_ids)
+            num_decodes_running = len(
+                scheduler_output.scheduled_cached_reqs.req_ids)
 
     def _handle_empty_scheduler_output(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
@@ -498,11 +503,10 @@ class HATModelWorker(Worker):
         set_random_seed(self.model_config.seed)
 
         if self.model_runner_cls is None:
-            self.model_runner = GPUModelRunner(
-                self.vllm_config, self.device)
+            self.model_runner = GPUModelRunner(self.vllm_config, self.device)
         else:
-            self.model_runner = self.model_runner_cls(
-                self.vllm_config, self.device)
+            self.model_runner = self.model_runner_cls(self.vllm_config,
+                                                      self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

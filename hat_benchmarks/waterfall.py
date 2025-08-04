@@ -1,15 +1,13 @@
-from matplotlib import pyplot as plt
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter, NullFormatter, StrMethodFormatter, FuncFormatter
-import numpy as np
-import json
-import os
-import glob
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
-from enum import Enum
-import re
+import json
 import math
+import os
+import re
+
+import numpy as np
+from matplotlib import pyplot as plt
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,10 +53,10 @@ def get_batch_size_from_filename(filename: str) -> int:
 
 
 def get_json_files(hat_json_file: str, llama_json_file: str) -> tuple[dict, dict]:
-    with open(hat_json_file, "r") as f:
+    with open(hat_json_file) as f:
         hat_json = json.load(f)
         
-    with open(llama_json_file, "r") as f:
+    with open(llama_json_file) as f:
         llama_json = json.load(f)
     
     return hat_json, llama_json

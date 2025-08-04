@@ -6,7 +6,7 @@
 
 This branch provides a batched inference implementation of HAT (Hierarchical Autoregressive Transformer). This fork integrates HAT into vLLM v1 so you can run or serve HAT models with the same low-latency engine you know from vLLM. HAT wraps a standard Llama-style word-level transformer (referred to as the backbone) with two small byte-level modules: an encoder and a decoder.  For a comprehensive architectural and training deep-dive, including a closer look at each component discussed below, an accompanying research paper will soon be released; which will also provide more information on the challenges behind batched inference for such a model.
 
-The encoder processes the input text as raw UTF-8 bytes, and produces a sequence of activations of the same length. The splitter is then in charge of splitting this text into words or semantically meaningful chunks. In the encoder connector layer, for each word, a learned latent vector attends to the encoder activations of the bytes which compose the word. The backbone then processes this word-level sequence to produce a sequence of word-level representations which guide the decoding process. Thus, to generate bytes auto-regressively, the decoder uses the encoder activations of the current word and the word-level representation of the previous word. 
+The encoder processes the input text as raw UTF-8 bytes, and produces a sequence of activations of the same length. The splitter is then in charge of splitting this text into words or semantically meaningful chunks. In the encoder connector layer, for each word, a learned latent vector attends to the encoder activations of the bytes which compose the word. The backbone then processes this word-level sequence to produce a sequence of word-level representations which guide the decoding process. Thus, to generate bytes auto-regressively, the decoder uses the encoder activations of the current word and the word-level representation of the previous word.
 
 Next Steps:
 - Currently, our CUDA graph implementation for HAT is still based on the vLLM v0 approach. When [PR 20059](https://github.com/vllm-project/vllm/pull/20059) gets merged, we will update our implementation and perform an upstream MR to vLLM.
@@ -15,10 +15,11 @@ Next Steps:
 ---
 # Environment Setup
 
-### 1. Prerequisites
-* **GPU**: NVIDIA GPU
-* **Python**: 3.12. 
+## 1. Prerequisites
+- **GPU**: NVIDIA GPU
+- **Python**: 3.12.
 ### 2. Clone and install
+
 ```bash
 git clone <this-repository> vllm-hat
 cd vllm-hat
@@ -42,7 +43,7 @@ Points to keep in mind
 - If you want to test out the 70B model, please make sure to specify tensor parallel size. If testing on GPUs with 80GB VRAM, we recommend setting tensor parallel size to 4.
 - Currently, HAT only works with Flash Attention 2. Thus, if testing this model on Hopper architecture or newer, please make sure to export the environment variable `VLLM_FLASH_ATTN_VERSION = 2`.
 
-These are the HAT models:
+These are the available HAT models:
 - `Aleph-Alpha/llama-tfree-hat-pretrained-7b-dpo`
 - `Aleph-Alpha/tfree-hat-pretrained-7b-base`
 - `Aleph-Alpha/llama-3_1-8b-tfree-hat-dpo`
@@ -50,9 +51,9 @@ These are the HAT models:
 - `Aleph-Alpha/llama-3_1-8b-tfree-hat-base`
 - `Aleph-Alpha/llama-3_1-70b-tfree-hat-sft`
 ---
-## Offline Inference 
+## Offline Inference
 
-We have included an example script to run offline inference. 
+We have included an example script to run offline inference.
 
 ```bash
 python hat_scripts/hat_offline_inference.py [OPTIONS]
@@ -74,6 +75,7 @@ vllm serve [MODEL] [OPTIONS]
 ```
 
 **Example:**
+
 ```bash
 vllm serve "Aleph-Alpha/llama-tfree-hat-pretrained-7b-dpo" \
   --trust-remote-code \
@@ -106,7 +108,6 @@ python hat_scripts/send_async_prompts.py [OPTIONS]
 - `--api-url` - URL of the OpenAI-compatible chat completions API endpoint (default: http://localhost:8000/v1/chat/completions)
 - `--num-concurrent-requests` - Number of concurrent requests to send (default: 16)
 - `--max-bytes-per-req` - Output bytes (default: 1000)
-
 
 ---
 ---

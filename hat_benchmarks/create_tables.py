@@ -1,8 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import json
 import os
-import re
-from typing import Optional
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,10 +54,10 @@ def main() -> None:
         )
         return
 
-    with open(hat_file_path, "r") as f:
+    with open(hat_file_path) as f:
         hat_data = json.load(f)
 
-    with open(llama_file_path, "r") as f:
+    with open(llama_file_path) as f:
         llama_data = json.load(f)
 
     batch_key = f"batch_size_{args.batch_size}"

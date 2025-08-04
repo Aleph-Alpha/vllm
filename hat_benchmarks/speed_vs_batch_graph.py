@@ -1,9 +1,11 @@
-import argparse 
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import argparse
 import json
 import os
+
 import matplotlib.pyplot as plt
 import numpy as np
-from typing import Optional
 
 # ========== PLOT CONFIGURATION PARAMETERS ==========
 # Borrowed and adapted from plotting_utils.py
@@ -61,10 +63,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 def get_json_files(hat_json_file: str, llama_json_file: str) -> tuple[dict, dict]:
-    with open(hat_json_file, "r") as f:
+    with open(hat_json_file) as f:
         hat_json = json.load(f)
         
-    with open(llama_json_file, "r") as f:
+    with open(llama_json_file) as f:
         llama_json = json.load(f)
     
     hat_json = hat_json[next(iter(hat_json.keys()))]
@@ -170,7 +172,7 @@ def create_comparison_plot(ax, title, y_label, batch_sizes, hat_data, hat_errors
             ax.set_yticks(yticks)
     
     # Format y-axis labels
-    from matplotlib.ticker import StrMethodFormatter, NullFormatter
+    from matplotlib.ticker import NullFormatter, StrMethodFormatter
     ax.yaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
     ax.yaxis.set_minor_formatter(NullFormatter())
     

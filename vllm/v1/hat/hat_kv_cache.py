@@ -12,7 +12,7 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock, init_none_hash
 from vllm.v1.core.single_type_kv_cache_manager import (
-    SingleTypeKVCacheManager, get_manager_for_kv_cache_spec)
+    get_manager_for_kv_cache_spec)
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.hat.hat_utils import HATKVCacheState, split_text
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
@@ -165,13 +165,22 @@ class HATKVCacheManager(KVCacheManager):
 
         else:
             copy_state = HATKVCacheState(
-                num_curr_word_bytes=self.req_id_to_hat_info[request.request_id].num_curr_word_bytes,
-                num_computed_tokens_backbone=self.req_id_to_hat_info[request.request_id].num_computed_tokens_backbone,
-                num_computed_tokens_byte=self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte)
+                num_curr_word_bytes=self.req_id_to_hat_info[
+                    request.request_id].num_curr_word_bytes,
+                num_computed_tokens_backbone=self.req_id_to_hat_info[
+                    request.request_id].num_computed_tokens_backbone,
+                num_computed_tokens_byte=self.req_id_to_hat_info[
+                    request.request_id].num_computed_tokens_byte)
             if len(request._all_token_ids) - request.num_computed_tokens == 1:
-                num_new_tokens = len(request._all_token_ids) - self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte
-            start_idx = self.req_id_to_hat_info[request.request_id].num_computed_tokens_byte - self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
-            offset = num_new_tokens + self.req_id_to_hat_info[request.request_id].num_curr_word_bytes
+                num_new_tokens = len(
+                    request._all_token_ids) - self.req_id_to_hat_info[
+                        request.request_id].num_computed_tokens_byte
+            start_idx = self.req_id_to_hat_info[
+                request.
+                request_id].num_computed_tokens_byte - self.req_id_to_hat_info[
+                    request.request_id].num_curr_word_bytes
+            offset = num_new_tokens + self.req_id_to_hat_info[
+                request.request_id].num_curr_word_bytes
             words = split_text(
                 self.hat_splitter,
                 request._all_token_ids[start_idx:start_idx + offset])
@@ -335,8 +344,9 @@ class HATKVCacheCoordinator(HybridKVCacheCoordinator):
                 request_id, num_tokens[i], new_computed_blocks[i])
         return num_blocks_to_allocate
 
-    def allocate_new_blocks(self, request_id: str,
-                            num_tokens: List[int]) -> tuple[list[KVCacheBlock]]:
+    def allocate_new_blocks(
+            self, request_id: str,
+            num_tokens: List[int]) -> tuple[list[KVCacheBlock]]:
         """
         Allocate new blocks for the request to give it at least `num_tokens` 
         token slots.

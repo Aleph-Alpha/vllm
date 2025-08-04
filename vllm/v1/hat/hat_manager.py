@@ -5,8 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from vllm.config import VllmConfig
-from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
-                                       SchedulerOutput)
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.hat.hat_model_runner import HATModelRunner
 from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.hat.hat_utils import (HATEncoderConnectorInput,
@@ -131,13 +130,18 @@ class HATManager:
             match (req_state.request_type,
                    cached_reqs.resumed_from_preemption[idx]):
                 case (HATRequestType.CHUNKED_PREFILL, _) | (_, True):
-                    scheduler_output_byte.scheduled_cached_reqs.req_ids.append(req_id)
-                    scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption.append(cached_reqs.resumed_from_preemption[idx])
-                    scheduler_output_byte.scheduled_cached_reqs.new_block_ids.append(block_table_enc_dec)
-                    scheduler_output_byte.scheduled_cached_reqs.num_computed_tokens.append(cached_reqs.num_computed_tokens[idx])
+                    scheduler_output_byte.scheduled_cached_reqs.req_ids.append(
+                        req_id)
+                    scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption.append(
+                        cached_reqs.resumed_from_preemption[idx])
+                    scheduler_output_byte.scheduled_cached_reqs.new_block_ids.append(
+                        block_table_enc_dec)
+                    scheduler_output_byte.scheduled_cached_reqs.num_computed_tokens.append(
+                        cached_reqs.num_computed_tokens[idx])
 
                     if cached_reqs.resumed_from_preemption[idx]:
-                        self._resume_preempted_sequence(req_id, num_scheduled_tokens)
+                        self._resume_preempted_sequence(
+                            req_id, num_scheduled_tokens)
                         req_state = self.req_ids_to_hat_state[req_id]
                         req_state.num_scheduled_tokens_byte = num_scheduled_tokens
                     else:
@@ -149,14 +153,20 @@ class HATManager:
                     num_scheduled_tokens_backbone = len(word_lens_bytes) - 1
                     req_state.num_scheduled_tokens_backbone = num_scheduled_tokens_backbone
                     if num_scheduled_tokens_backbone > 0:
-                        scheduler_output_word.scheduled_cached_reqs.req_ids.append(req_id)
-                        scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(cached_reqs.resumed_from_preemption[idx] or req_state.is_small_chunked_prefill_after_preemption)
-                        scheduler_output_word.scheduled_cached_reqs.new_block_ids.append(block_table_backbone)
-                        scheduler_output_word.scheduled_cached_reqs.num_computed_tokens.append(req_state.word_position_cpu)
+                        scheduler_output_word.scheduled_cached_reqs.req_ids.append(
+                            req_id)
+                        scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(
+                            cached_reqs.resumed_from_preemption[idx] or
+                            req_state.is_small_chunked_prefill_after_preemption
+                        )
+                        scheduler_output_word.scheduled_cached_reqs.new_block_ids.append(
+                            block_table_backbone)
+                        scheduler_output_word.scheduled_cached_reqs.num_computed_tokens.append(
+                            req_state.word_position_cpu)
                         scheduler_output_word.num_scheduled_tokens[
                             req_id] = num_scheduled_tokens_backbone
                         scheduler_output_word.total_num_scheduled_tokens += num_scheduled_tokens_backbone
-                        
+
                         req_state.is_small_chunked_prefill_after_preemption = False
                     else:
                         req_state.is_small_chunked_prefill_after_preemption = True
@@ -171,7 +181,9 @@ class HATManager:
                     else:
                         req_state.block_table_backbone = block_table_backbone
 
-                    decodes_word_boundary.append((req_id, block_table_enc_dec, req_state.is_small_chunked_prefill_after_preemption))
+                    decodes_word_boundary.append(
+                        (req_id, block_table_enc_dec,
+                         req_state.is_small_chunked_prefill_after_preemption))
                     # Update scheduler_output_word
                     scheduler_output_word.num_scheduled_tokens[req_id] = 1
                     scheduler_output_word.total_num_scheduled_tokens += 1
@@ -186,29 +198,38 @@ class HATManager:
                         req_state.block_table_backbone = block_table_backbone
 
                     self.req_ids_to_hat_state[req_id].word_lens_bytes = [1]
-                    decodes_not_word_boundary.append((req_id, block_table_enc_dec))
+                    decodes_not_word_boundary.append(
+                        (req_id, block_table_enc_dec))
 
                 case _:
                     raise ValueError(
                         f"Invalid request type: {req_state.request_type}")
-                    
+
         for req_id, block_table_enc_dec, is_small_chunked_prefill_after_preemption in decodes_word_boundary:
             scheduler_output_byte.scheduled_cached_reqs.req_ids.append(req_id)
-            scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption.append(False)
-            scheduler_output_byte.scheduled_cached_reqs.new_block_ids.append(block_table_enc_dec)
-            scheduler_output_byte.scheduled_cached_reqs.num_computed_tokens.append(self.req_ids_to_hat_state[req_id].byte_position)
+            scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption.append(
+                False)
+            scheduler_output_byte.scheduled_cached_reqs.new_block_ids.append(
+                block_table_enc_dec)
+            scheduler_output_byte.scheduled_cached_reqs.num_computed_tokens.append(
+                self.req_ids_to_hat_state[req_id].byte_position)
 
             scheduler_output_word.scheduled_cached_reqs.req_ids.append(req_id)
-            scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(is_small_chunked_prefill_after_preemption)
-            scheduler_output_word.scheduled_cached_reqs.new_block_ids.append(self.req_ids_to_hat_state[req_id].block_table_backbone)
-            scheduler_output_word.scheduled_cached_reqs.num_computed_tokens.append(self.req_ids_to_hat_state[req_id].word_position_cpu)
+            scheduler_output_word.scheduled_cached_reqs.resumed_from_preemption.append(
+                is_small_chunked_prefill_after_preemption)
+            scheduler_output_word.scheduled_cached_reqs.new_block_ids.append(
+                self.req_ids_to_hat_state[req_id].block_table_backbone)
+            scheduler_output_word.scheduled_cached_reqs.num_computed_tokens.append(
+                self.req_ids_to_hat_state[req_id].word_position_cpu)
 
-        
         for req_id, block_table_enc_dec in decodes_not_word_boundary:
             scheduler_output_byte.scheduled_cached_reqs.req_ids.append(req_id)
-            scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption.append(False)
-            scheduler_output_byte.scheduled_cached_reqs.new_block_ids.append(block_table_enc_dec)
-            scheduler_output_byte.scheduled_cached_reqs.num_computed_tokens.append(self.req_ids_to_hat_state[req_id].byte_position)
+            scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption.append(
+                False)
+            scheduler_output_byte.scheduled_cached_reqs.new_block_ids.append(
+                block_table_enc_dec)
+            scheduler_output_byte.scheduled_cached_reqs.num_computed_tokens.append(
+                self.req_ids_to_hat_state[req_id].byte_position)
 
         self.num_decodes_not_word_boundary = len(decodes_not_word_boundary)
         self.num_decodes_word_boundary = len(decodes_word_boundary)
@@ -254,10 +275,17 @@ class HATManager:
         scheduler_output_byte_enc_dec = _create_empty_scheduler_output()
         scheduler_output_byte_final_decoder = _create_empty_scheduler_output()
         decodes = 0
-        req_ids = [new_req.req_id for new_req in scheduler_output_byte.scheduled_new_reqs]
-        req_id_to_new_req_data = {new_req.req_id: new_req for new_req in scheduler_output_byte.scheduled_new_reqs}
+        req_ids = [
+            new_req.req_id
+            for new_req in scheduler_output_byte.scheduled_new_reqs
+        ]
+        req_id_to_new_req_data = {
+            new_req.req_id: new_req
+            for new_req in scheduler_output_byte.scheduled_new_reqs
+        }
         num_new_req_ids = len(req_ids)
-        for idx, req_id in enumerate(req_ids + scheduler_output_byte.scheduled_cached_reqs.req_ids):
+        for idx, req_id in enumerate(
+                req_ids + scheduler_output_byte.scheduled_cached_reqs.req_ids):
             word_lens_bytes = self.req_ids_to_hat_state[req_id].word_lens_bytes
             req_state = self.req_ids_to_hat_state[req_id]
 
@@ -286,8 +314,9 @@ class HATManager:
 
                     self.req_ids_to_hat_state[
                         req_id].encoder_embeds_curr_word.append(
-                            encoder_hidden_states[offset:offset +
-                                                  word_lens_bytes[-1], :].clone())
+                            encoder_hidden_states[
+                                offset:offset +
+                                word_lens_bytes[-1], :].clone())
 
                     offset += word_lens_bytes[-1]
                     offset_beginning += num_bytes_excl_last_word + word_lens_bytes[
@@ -298,10 +327,14 @@ class HATManager:
                             req_id_to_new_req_data[req_id])
                     else:
                         # Block Ids are not needed here, bcause this goes into the decoder which does not update the states
-                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids.append(req_id)
-                        resumed_from_preemption = scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption[idx - num_new_req_ids]
-                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.resumed_from_preemption.append(resumed_from_preemption)
-                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.num_computed_tokens.append(req_state.byte_position)
+                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids.append(
+                            req_id)
+                        resumed_from_preemption = scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption[
+                            idx - num_new_req_ids]
+                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.resumed_from_preemption.append(
+                            resumed_from_preemption)
+                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.num_computed_tokens.append(
+                            req_state.byte_position)
 
                     scheduler_output_byte_final_decoder.num_scheduled_tokens[
                         req_id] = req_state.num_scheduled_tokens_byte
@@ -312,8 +345,9 @@ class HATManager:
                     offset += num_bytes_excl_last_word
                     self.req_ids_to_hat_state[
                         req_id].encoder_embeds_curr_word.append(
-                            encoder_hidden_states[offset:offset +
-                                                  word_lens_bytes[-1], :].clone())
+                            encoder_hidden_states[
+                                offset:offset +
+                                word_lens_bytes[-1], :].clone())
 
                     if req_state.num_scheduled_tokens_backbone > 0:
                         encoder_hidden_states_encoder_connector.append(
@@ -332,11 +366,15 @@ class HATManager:
                         scheduler_output_byte_final_decoder.scheduled_new_reqs.append(
                             req_id_to_new_req_data[req_id])
                     else:
-                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids.append(req_id)
-                        resumed_from_preemption = scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption[idx - num_new_req_ids]
+                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids.append(
+                            req_id)
+                        resumed_from_preemption = scheduler_output_byte.scheduled_cached_reqs.resumed_from_preemption[
+                            idx - num_new_req_ids]
                         assert resumed_from_preemption, "Resumed from preemption should be True for prefills"
-                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.resumed_from_preemption.append(resumed_from_preemption)
-                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.num_computed_tokens.append(req_state.byte_position)
+                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.resumed_from_preemption.append(
+                            resumed_from_preemption)
+                        scheduler_output_byte_final_decoder.scheduled_cached_reqs.num_computed_tokens.append(
+                            req_state.byte_position)
 
                     scheduler_output_byte_final_decoder.num_scheduled_tokens[
                         req_id] = req_state.num_scheduled_tokens_byte
@@ -348,9 +386,12 @@ class HATManager:
                             encoder_hidden_states_decodes[decodes:decodes +
                                                           1, :])
 
-                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids.append(req_id)
-                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.resumed_from_preemption.append(False)
-                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.num_computed_tokens.append(req_state.byte_position)
+                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids.append(
+                        req_id)
+                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.resumed_from_preemption.append(
+                        False)
+                    scheduler_output_byte_final_decoder.scheduled_cached_reqs.num_computed_tokens.append(
+                        req_state.byte_position)
 
                     scheduler_output_byte_final_decoder.num_scheduled_tokens[
                         req_id] = 1
@@ -367,9 +408,12 @@ class HATManager:
                             encoder_hidden_states_decodes[decodes:decodes +
                                                           1, :])
 
-                    scheduler_output_byte_enc_dec.scheduled_cached_reqs.req_ids.append(req_id)
-                    scheduler_output_byte_enc_dec.scheduled_cached_reqs.resumed_from_preemption.append(False)
-                    scheduler_output_byte_enc_dec.scheduled_cached_reqs.num_computed_tokens.append(req_state.byte_position)
+                    scheduler_output_byte_enc_dec.scheduled_cached_reqs.req_ids.append(
+                        req_id)
+                    scheduler_output_byte_enc_dec.scheduled_cached_reqs.resumed_from_preemption.append(
+                        False)
+                    scheduler_output_byte_enc_dec.scheduled_cached_reqs.num_computed_tokens.append(
+                        req_state.byte_position)
                     scheduler_output_byte_enc_dec.num_scheduled_tokens[
                         req_id] = 1
                     scheduler_output_byte_enc_dec.total_num_scheduled_tokens += 1
@@ -407,7 +451,10 @@ class HATManager:
         byte_positions = []
         word_positions = []
 
-        req_ids = [new_req.req_id for new_req in scheduler_output_word.scheduled_new_reqs]
+        req_ids = [
+            new_req.req_id
+            for new_req in scheduler_output_word.scheduled_new_reqs
+        ]
         for req_id in req_ids + scheduler_output_word.scheduled_cached_reqs.req_ids:
             req_state = self.req_ids_to_hat_state[req_id]
 
@@ -490,8 +537,10 @@ class HATManager:
         )
 
     def handle_backbone_output(
-            self, scheduler_output_byte_final_decoder: SchedulerOutput,
-            predictive_word_embeddings: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self,
+        scheduler_output_byte_final_decoder: SchedulerOutput,
+        predictive_word_embeddings: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         predictive_word_embeddings_decodes = None
         if predictive_word_embeddings is not None:
             predictive_word_embeddings_decodes = safe_tensor_slice(
@@ -502,7 +551,10 @@ class HATManager:
 
         num_decodes = 0
         offset = 0
-        req_ids = [new_req.req_id for new_req in scheduler_output_byte_final_decoder.scheduled_new_reqs]
+        req_ids = [
+            new_req.req_id for new_req in
+            scheduler_output_byte_final_decoder.scheduled_new_reqs
+        ]
         for req_id in req_ids + scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids:
             req_state = self.req_ids_to_hat_state[req_id]
 
@@ -560,7 +612,10 @@ class HATManager:
             self, scheduler_output_byte_final_decoder: SchedulerOutput
     ) -> torch.Tensor:
         word_lens_bytes_per_task = []
-        req_ids = [new_req.req_id for new_req in scheduler_output_byte_final_decoder.scheduled_new_reqs]
+        req_ids = [
+            new_req.req_id for new_req in
+            scheduler_output_byte_final_decoder.scheduled_new_reqs
+        ]
         for req_id in req_ids + scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids:
             req_state = self.req_ids_to_hat_state[req_id]
             word_lens_bytes_per_task.extend(req_state.word_lens_bytes)
@@ -588,8 +643,8 @@ class HATManager:
     def update_backbone_info_decode_path(
             self, predictive_word_embeddings: torch.Tensor):
         predictive_word_embeddings_copy = predictive_word_embeddings.clone()
-        for i, req_id in enumerate(
-                self.scheduler_output_word_decodes.scheduled_cached_reqs.req_ids):
+        for i, req_id in enumerate(self.scheduler_output_word_decodes.
+                                   scheduled_cached_reqs.req_ids):
             req_state = self.req_ids_to_hat_state[req_id]
             req_state.word_position_cpu += 1
             req_state.block_table_backbone = []
@@ -627,21 +682,24 @@ class HATManager:
         cached_reqs_ids = safe_list_slice(
             scheduler_output_byte_final_decoder.scheduled_cached_reqs.req_ids,
             self.num_decodes_word_boundary)
-        new_req_ids = [new_req.req_id for new_req in scheduler_output_byte_final_decoder.scheduled_new_reqs]
+        new_req_ids = [
+            new_req.req_id for new_req in
+            scheduler_output_byte_final_decoder.scheduled_new_reqs
+        ]
         for req_id in new_req_ids + cached_reqs_ids:
             req_state = self.req_ids_to_hat_state[req_id]
             assert req_id not in self.output.req_id_to_index
 
             self.output.req_id_to_index[req_id] = len(self.output.req_ids)
             self.output.req_ids.append(req_id)
-            self.output.prompt_logprobs_dict[req_id] = model_runner_output.prompt_logprobs_dict.get(req_id)
+            self.output.prompt_logprobs_dict[
+                req_id] = model_runner_output.prompt_logprobs_dict.get(req_id)
 
             new_token_id = None
-            
-            # Assume byte_position == num_computed_tokens 
+
+            # Assume byte_position == num_computed_tokens
             last_chunked_prefill_condition = len(req_state.all_token_ids) == (
-                req_state.num_scheduled_tokens_byte +
-                req_state.byte_position)
+                req_state.num_scheduled_tokens_byte + req_state.byte_position)
 
             if not req_state.request_type == HATRequestType.CHUNKED_PREFILL or last_chunked_prefill_condition:
                 req_id_index_step = model_runner_output.req_id_to_index[req_id]
@@ -650,11 +708,17 @@ class HATManager:
                         req_id_index_step]
                 new_token_id = sampled_token_ids[0]
                 self.output.sampled_token_ids.append([new_token_id])
-                
+
                 if model_runner_output.logprobs is not None:
-                    self.output.logprobs.logprob_token_ids.append(model_runner_output.logprobs.logprob_token_ids[req_id_index_step])
-                    self.output.logprobs.logprobs.append(model_runner_output.logprobs.logprobs[req_id_index_step])
-                    self.output.logprobs.sampled_token_ranks.append(model_runner_output.logprobs.sampled_token_ranks[req_id_index_step])
+                    self.output.logprobs.logprob_token_ids.append(
+                        model_runner_output.logprobs.
+                        logprob_token_ids[req_id_index_step])
+                    self.output.logprobs.logprobs.append(
+                        model_runner_output.logprobs.
+                        logprobs[req_id_index_step])
+                    self.output.logprobs.sampled_token_ranks.append(
+                        model_runner_output.logprobs.
+                        sampled_token_ranks[req_id_index_step])
 
                 req_state.request_type = HATRequestType.DECODE
 
@@ -719,11 +783,17 @@ class HATManager:
                         req_id_index_step]
                 new_token_id = sampled_token_ids[0]
                 self.output.sampled_token_ids.append([new_token_id])
-                
+
                 if model_runner_output.logprobs is not None:
-                    self.output.logprobs.logprob_token_ids.append(model_runner_output.logprobs.logprob_token_ids[req_id_index_step])
-                    self.output.logprobs.logprobs.append(model_runner_output.logprobs.logprobs[req_id_index_step])
-                    self.output.logprobs.sampled_token_ranks.append(model_runner_output.logprobs.sampled_token_ranks[req_id_index_step])
+                    self.output.logprobs.logprob_token_ids.append(
+                        model_runner_output.logprobs.
+                        logprob_token_ids[req_id_index_step])
+                    self.output.logprobs.logprobs.append(
+                        model_runner_output.logprobs.
+                        logprobs[req_id_index_step])
+                    self.output.logprobs.sampled_token_ranks.append(
+                        model_runner_output.logprobs.
+                        sampled_token_ranks[req_id_index_step])
             else:
                 # self.output.req_id_to_index contains info for all seqs in this worker step
                 # model_runner_output only contains info about seq currently running in the loop
@@ -736,11 +806,19 @@ class HATManager:
                 new_token_id = sampled_token_ids[0]
                 self.output.sampled_token_ids[req_id_index_output].append(
                     new_token_id)
-                
+
                 if model_runner_output.logprobs is not None:
-                    self.output.logprobs.logprob_token_ids[req_id_index_output].append(model_runner_output.logprobs.logprob_token_ids[req_id_index_step][0])
-                    self.output.logprobs.logprobs[req_id_index_output].append(model_runner_output.logprobs.logprobs[req_id_index_step][0])
-                    self.output.logprobs.sampled_token_ranks[req_id_index_output].append(model_runner_output.logprobs.sampled_token_ranks[req_id_index_step][0])
+                    self.output.logprobs.logprob_token_ids[
+                        req_id_index_output].append(
+                            model_runner_output.logprobs.
+                            logprob_token_ids[req_id_index_step][0])
+                    self.output.logprobs.logprobs[req_id_index_output].append(
+                        model_runner_output.logprobs.
+                        logprobs[req_id_index_step][0])
+                    self.output.logprobs.sampled_token_ranks[
+                        req_id_index_output].append(
+                            model_runner_output.logprobs.
+                            sampled_token_ranks[req_id_index_step][0])
 
             req_state.byte_position += 1
             curr_word_bytes = req_state.curr_word_bytes
@@ -760,10 +838,14 @@ class HATManager:
                         req_id] = 1
                     self.scheduler_output_word_decodes.total_num_scheduled_tokens += 1
 
-                    self.scheduler_output_word_decodes.scheduled_cached_reqs.req_ids.append(req_id)
-                    self.scheduler_output_word_decodes.scheduled_cached_reqs.resumed_from_preemption.append(req_state.is_small_chunked_prefill_after_preemption)
-                    self.scheduler_output_word_decodes.scheduled_cached_reqs.new_block_ids.append(req_state.block_table_backbone)
-                    self.scheduler_output_word_decodes.scheduled_cached_reqs.num_computed_tokens.append(req_state.word_position_cpu)
+                    self.scheduler_output_word_decodes.scheduled_cached_reqs.req_ids.append(
+                        req_id)
+                    self.scheduler_output_word_decodes.scheduled_cached_reqs.resumed_from_preemption.append(
+                        req_state.is_small_chunked_prefill_after_preemption)
+                    self.scheduler_output_word_decodes.scheduled_cached_reqs.new_block_ids.append(
+                        req_state.block_table_backbone)
+                    self.scheduler_output_word_decodes.scheduled_cached_reqs.num_computed_tokens.append(
+                        req_state.word_position_cpu)
                     req_state.is_small_chunked_prefill_after_preemption = False
 
                 if words:
@@ -775,7 +857,10 @@ class HATManager:
                     if len_new_word > 1:
                         req_state.encoder_embeds_new_word = req_state.encoder_embeds_curr_word[
                             -len_new_word + 1:]
-                        req_state.encoder_embeds_curr_word = req_state.encoder_embeds_curr_word[:-len_new_word + 1]
+                        req_state.encoder_embeds_curr_word = req_state.encoder_embeds_curr_word[:
+                                                                                                -len_new_word
+                                                                                                +
+                                                                                                1]
                 else:
                     req_state.new_word_first_bytes = [
                         req_state.curr_word_bytes.pop()
@@ -786,11 +871,15 @@ class HATManager:
                 scheduler_output_byte_enc_dec_running_tmp.num_scheduled_tokens[
                     req_id] = 1
                 scheduler_output_byte_enc_dec_running_tmp.total_num_scheduled_tokens += 1
-                
-                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.req_ids.append(req_id)
-                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.resumed_from_preemption.append(False)
-                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.new_block_ids.append(([],))
-                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.num_computed_tokens.append(req_state.byte_position)
+
+                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.req_ids.append(
+                    req_id)
+                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.resumed_from_preemption.append(
+                    False)
+                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.new_block_ids.append(
+                    ([], ))
+                scheduler_output_byte_enc_dec_running_tmp.scheduled_cached_reqs.num_computed_tokens.append(
+                    req_state.byte_position)
 
         return scheduler_output_byte_enc_dec_running_tmp
 
@@ -848,7 +937,8 @@ class HATManager:
         )
         return num_scheduled_tokens_backbone
 
-    def _resume_preempted_sequence(self, req_id: str, num_scheduled_tokens: int):
+    def _resume_preempted_sequence(self, req_id: str,
+                                   num_scheduled_tokens: int):
         """Initialises HATSequenceState for a preempted sequence
 
         Returns:
@@ -856,13 +946,15 @@ class HATManager:
         """
         req_state = self.req_ids_to_hat_state[req_id]
 
-        text_words_bytes = split_text(self.hat_splitter, req_state.all_token_ids)
+        text_words_bytes = split_text(self.hat_splitter,
+                                      req_state.all_token_ids)
 
         word_lens_bytes = [
             len(text_word_bytes) for text_word_bytes in text_words_bytes
         ]
 
-        is_partial_prefill = len(req_state.all_token_ids) > num_scheduled_tokens
+        is_partial_prefill = len(
+            req_state.all_token_ids) > num_scheduled_tokens
         request_type = HATRequestType.CHUNKED_PREFILL if is_partial_prefill else HATRequestType.PREFILL
 
         cu_word_lens_bytes = torch.cumsum(torch.tensor(word_lens_bytes), dim=0)
@@ -910,8 +1002,9 @@ class HATManager:
         req_state = self.req_ids_to_hat_state[req_id]
 
         text_words_bytes = split_text(
-            self.hat_splitter,
-            req_state.curr_word_bytes + req_state.all_token_ids[req_state.byte_position:req_state.byte_position + num_scheduled_tokens])
+            self.hat_splitter, req_state.curr_word_bytes + req_state.
+            all_token_ids[req_state.byte_position:req_state.byte_position +
+                          num_scheduled_tokens])
 
         # word_lens_bytes always only includes characters from this worker step
         word_lens_bytes = [

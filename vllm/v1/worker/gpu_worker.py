@@ -56,7 +56,7 @@ class Worker(WorkerBase):
                          rank=rank,
                          distributed_init_method=distributed_init_method,
                          is_driver_worker=is_driver_worker)
-        
+
         self.model_runner_cls = model_runner_cls
 
         if self.model_config.trust_remote_code:
@@ -173,11 +173,10 @@ class Worker(WorkerBase):
         set_random_seed(self.model_config.seed)
 
         if self.model_runner_cls is None:
-            self.model_runner = GPUModelRunner(
-                self.vllm_config, self.device)
+            self.model_runner = GPUModelRunner(self.vllm_config, self.device)
         else:
-            self.model_runner = self.model_runner_cls(
-                self.vllm_config, self.device)
+            self.model_runner = self.model_runner_cls(self.vllm_config,
+                                                      self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

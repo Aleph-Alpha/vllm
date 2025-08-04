@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import sys
+
 
 def create_markdown_table(data):
     """
@@ -75,7 +78,7 @@ def main():
     input_file = sys.argv[1]
 
     try:
-        with open(input_file, 'r') as f:
+        with open(input_file) as f:
             data = json.load(f)
     except FileNotFoundError:
         print(f"Error: File not found at {input_file}")

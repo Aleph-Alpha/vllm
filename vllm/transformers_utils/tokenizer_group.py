@@ -118,4 +118,5 @@ def init_tokenizer_from_configs(model_config: ModelConfig,
         trust_remote_code=model_config.trust_remote_code,
         revision=model_config.tokenizer_revision,
         truncation_side=model_config.truncation_side,
-        special_token_dict=getattr(model_config.hf_config, "special_token_dict", None))
+        special_token_dict=getattr(model_config.hf_config,
+                                   "special_token_dict", None))

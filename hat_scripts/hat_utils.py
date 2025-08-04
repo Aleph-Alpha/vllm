@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 allowed_hat_models = [
     "Aleph-Alpha/llama-tfree-hat-pretrained-7b-dpo",
     "Aleph-Alpha/tfree-hat-pretrained-7b-base",
