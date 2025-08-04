@@ -46,8 +46,7 @@ class HATRuleSplitter(HATSplitter):
             rf"({'|'.join(map(re.escape, special_token_dict.keys()))})")
                                       if special_token_dict else
                                       re.compile(r"(?!)"))
-        self.eot_id: Optional[int] = self.special_token_dict.get('<|eot_id|>')
-        assert self.eot_id, "eot_id not found in special_token_dict"
+        self.eot_id: int = self.special_token_dict.get('<|eot_id|>', 192)
 
     def encode(self, text: str) -> list[list[int]]:
         chunks = []

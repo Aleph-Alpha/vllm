@@ -47,6 +47,8 @@ class HATAttention(nn.Module):
                  bias: bool = False,
                  bias_o_proj: bool = False,
                  cache_config: Optional[CacheConfig] = None,
+                 key_query_norm: bool = False,
+                 key_query_norm_per_head: bool = False,
                  prefix: str = "") -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -113,6 +115,22 @@ class HATAttention(nn.Module):
             per_layer_sliding_window=None,
             prefix=f"{prefix}.attn",
         )
+        
+        self.key_query_norm = key_query_norm
+        self.key_query_norm_per_head = key_query_norm_per_head
+        
+        if self.key_query_norm:
+            if self.key_query_norm_per_head:
+                self.norm_query = RMSNorm(
+                    hidden_size=self.head_dim,
+                    eps=config.rms_norm_eps,
+                )
+                self.norm_key = RMSNorm(
+                    hidden_size=self.head_dim,
+                    eps=config.rms_norm_eps,
+                )
+            else:
+                raise ValueError("Key/query normalization across all heads (key_query_norm=True, key_query_norm_per_head=False) is not implemented as it would require comms for tensor parallelism.")
 
     def forward(
         self,
@@ -121,6 +139,15 @@ class HATAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        if self.key_query_norm and self.key_query_norm_per_head:
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            q = self.norm_query(q)
+            k = self.norm_key(k)
+            q = q.view(-1, self.num_heads * self.head_dim)
+            k = k.view(-1, self.num_kv_heads * self.head_dim)
+            
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -143,6 +170,8 @@ class HATCrossAttention(nn.Module):
                  bias: bool = False,
                  bias_o_proj: bool = False,
                  cache_config: Optional[CacheConfig] = None,
+                 key_query_norm: bool = False,
+                 key_query_norm_per_head: bool = False,
                  prefix: str = "") -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -207,6 +236,23 @@ class HATCrossAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=config.is_neox_style,
         )
+        
+        self.key_query_norm = key_query_norm
+        self.key_query_norm_per_head = key_query_norm_per_head
+        
+        if self.key_query_norm:
+            if self.key_query_norm_per_head:
+                self.norm_query = RMSNorm(
+                    hidden_size=self.head_dim,
+                    eps=config.rms_norm_eps,
+                )
+                self.norm_key = RMSNorm(
+                    hidden_size=self.head_dim,
+                    eps=config.rms_norm_eps,
+                )
+            else:
+                raise ValueError("Key/query normalization across all heads (key_query_norm=True, key_query_norm_per_head=False) is not implemented as it would require comms for tensor parallelism.")
+            
 
     def forward(
         self,
@@ -224,8 +270,15 @@ class HATCrossAttention(nn.Module):
         q, _ = self.q_proj(q_input)
         kv, _ = self.kv_proj(kv_input)
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-
-        # L TODO: Fix this later
+        
+        if self.key_query_norm and self.key_query_norm_per_head:
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            q = self.norm_query(q)
+            k = self.norm_key(k)
+            q = q.view(-1, self.num_heads * self.head_dim)
+            k = k.view(-1, self.num_kv_heads * self.head_dim)
+    
         q, _ = self.rotary_emb(q_position_ids, q, torch.zeros_like(q))
         _, k = self.rotary_emb(kv_position_ids, torch.zeros_like(k), k)
 
@@ -268,6 +321,8 @@ class HATGuideVectorAdd(nn.Module):
                  bias: bool = False,
                  bias_o_proj: bool = False,
                  cache_config: Optional[CacheConfig] = None,
+                 key_query_norm: bool = False,
+                 key_query_norm_per_head: bool = False,
                  prefix: str = "") -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -323,6 +378,21 @@ class HATGuideVectorAdd(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        self.key_query_norm = key_query_norm
+        self.key_query_norm_per_head = key_query_norm_per_head
+        
+        if self.key_query_norm:
+            if self.key_query_norm_per_head:
+                self.norm_query = RMSNorm(
+                    hidden_size=self.head_dim,
+                    eps=config.rms_norm_eps,
+                )
+                self.norm_key = RMSNorm(
+                    hidden_size=self.head_dim,
+                    eps=config.rms_norm_eps,
+                )
+            else:
+                raise ValueError("Key/query normalization across all heads (key_query_norm=True, key_query_norm_per_head=False) is not implemented as it would require comms for tensor parallelism.")
 
     def forward(
         self,
@@ -413,6 +483,8 @@ class HATTransformerLayer(nn.Module):
             bias=attention_bias,
             bias_o_proj=bias_o_proj,
             cache_config=cache_config,
+            key_query_norm=config.key_query_norm,
+            key_query_norm_per_head=config.key_query_norm_per_head,
             prefix=f"{prefix}.self_attn",
         )
         self.mlp = HATMLP(
@@ -492,6 +564,8 @@ class HATDecoderLayer(nn.Module):
             bias=attention_bias,
             bias_o_proj=bias_o_proj,
             cache_config=cache_config,
+            key_query_norm=config.cross_attention_config.key_query_norm,
+            key_query_norm_per_head=config.cross_attention_config.key_query_norm_per_head,
             prefix=f"{prefix}.cross_attn",
         )
 
@@ -573,6 +647,8 @@ class HATEncoderConnector(nn.Module):
             bias=attention_bias,
             bias_o_proj=bias_o_proj,
             cache_config=cache_config,
+            key_query_norm=config.cross_attention_config.key_query_norm,
+            key_query_norm_per_head=config.cross_attention_config.key_query_norm_per_head,
             prefix=f"{prefix}.cross_attn",
         )
 

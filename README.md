@@ -41,9 +41,10 @@ uv pip install -e .
 Points to keep in mind
 - If you want to test out the 70B model, please make sure to specify tensor parallel size. If testing on GPUs with 80GB VRAM, we recommend setting tensor parallel size to 4.
 - Currently, HAT only works with Flash Attention 2. Thus, if testing this model on Hopper architecture or newer, please make sure to export the environment variable `VLLM_FLASH_ATTN_VERSION = 2`.
-- Additionally, running the 70B on H100 or newer currently does not work.
 
-The supported HAT models are the following:
+These are the HAT models:
+- `Aleph-Alpha/llama-tfree-hat-pretrained-7b-dpo`
+- `Aleph-Alpha/tfree-hat-pretrained-7b-base`
 - `Aleph-Alpha/llama-3_1-8b-tfree-hat-dpo`
 - `Aleph-Alpha/llama-3_1-8b-tfree-hat-sft`
 - `Aleph-Alpha/llama-3_1-8b-tfree-hat-base`
@@ -58,7 +59,7 @@ python hat_scripts/hat_offline_inference.py [OPTIONS]
 ```
 
 **Optional Parameters:**
-- `--model` - Path to the HAT model (default: Aleph-Alpha/llama-3_1-8b-tfree-hat-dpo)
+- `--model` - Path to the HAT model (default: Aleph-Alpha/llama-tfree-hat-pretrained-7b-dpo)
 - `--batch-size` - Batch size for inference (default: 16)
 - `--max-bytes-per-req` - Output bytes (default: 1000)
 - `--tensor-parallel-size` - Tensor parallelism size (default: 1)
@@ -74,7 +75,7 @@ vllm serve [MODEL] [OPTIONS]
 
 **Example:**
 ```bash
-vllm serve "Aleph-Alpha/llama-3_1-8b-tfree-hat-dpo" \
+vllm serve "Aleph-Alpha/llama-tfree-hat-pretrained-7b-dpo" \
   --trust-remote-code \
   --dtype bfloat16 \
   --compilation-config '{"full_cuda_graph": true, "level": 0}'

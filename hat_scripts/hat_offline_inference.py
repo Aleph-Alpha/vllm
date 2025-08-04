@@ -8,14 +8,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        choices=allowed_hat_models,
         help="HAT model to run.",
         default=allowed_hat_models[0],
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        choices=range(1, len(prompts_128)),
+        choices=range(1, len(prompts_128) + 1),
         help="Batch size to run.",
         default=16,
     )

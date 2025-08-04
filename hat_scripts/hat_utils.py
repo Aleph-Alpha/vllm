@@ -1,4 +1,6 @@
 allowed_hat_models = [
+    "Aleph-Alpha/llama-tfree-hat-pretrained-7b-dpo",
+    "Aleph-Alpha/tfree-hat-pretrained-7b-base",
     "Aleph-Alpha/llama-3_1-8b-tfree-hat-dpo",
     "Aleph-Alpha/llama-3_1-8b-tfree-hat-sft",
     "Aleph-Alpha/llama-3_1-8b-tfree-hat-base",
