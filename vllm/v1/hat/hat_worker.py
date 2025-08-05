@@ -71,7 +71,8 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args,
 
     if worker_config.model_config.hf_config.sliding_window is None:
         worker_config.cache_config.sliding_window = None
-    if architecture != "HATBackboneForCausalLM":
+    use_smaller_tp = kwargs.get("use_smaller_tp", False)
+    if architecture != "HATBackboneForCausalLM" and use_smaller_tp:
         worker_config.parallel_config.tensor_parallel_size = 1
         worker_config.parallel_config.world_size = 1
 
@@ -86,17 +87,18 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args,
 class HATWorker(WorkerBase):
 
     def __init__(self, encoder_worker: WorkerBase, decoder_worker: WorkerBase,
-                 backbone_worker: WorkerBase, vllm_config: VllmConfig):
+                 backbone_worker: WorkerBase, vllm_config: VllmConfig, use_smaller_tp: bool = False):
         self.encoder_worker = SmallerTpWorker(
             encoder_worker
-        ) if vllm_config.parallel_config.tensor_parallel_size > 1 else encoder_worker
+        ) if vllm_config.parallel_config.tensor_parallel_size > 1 and use_smaller_tp else encoder_worker
         self.decoder_worker = SmallerTpWorker(
             decoder_worker
-        ) if vllm_config.parallel_config.tensor_parallel_size > 1 else decoder_worker
+        ) if vllm_config.parallel_config.tensor_parallel_size > 1 and use_smaller_tp else decoder_worker
         self.backbone_worker = backbone_worker
 
         self.encoder_connector = None
         self.hat_manager = None
+        self.use_smaller_tp = use_smaller_tp
 
         self.vllm_config = vllm_config
 
@@ -143,9 +145,13 @@ class HATWorker(WorkerBase):
             self.decoder_model_runner)
 
         self.default_stream = torch.cuda.default_stream()
-        self.stream_backbone = torch.cuda.Stream()
-        self.stream_enc_dec = torch.cuda.Stream()
-
+        if not self.use_smaller_tp and self.vllm_config.parallel_config.tensor_parallel_size > 1:
+            self.stream_backbone = torch.cuda.default_stream()
+            self.stream_enc_dec = torch.cuda.default_stream()
+        else:
+            self.stream_backbone = torch.cuda.Stream()
+            self.stream_enc_dec = torch.cuda.Stream()
+            
     def load_model(self) -> None:
         pass
 

@@ -692,6 +692,7 @@ class HATManager:
 
             self.output.req_id_to_index[req_id] = len(self.output.req_ids)
             self.output.req_ids.append(req_id)
+            self.output.sampled_token_ids.append([])
             self.output.prompt_logprobs_dict[
                 req_id] = model_runner_output.prompt_logprobs_dict.get(req_id)
 
@@ -707,7 +708,7 @@ class HATManager:
                     int] = model_runner_output.sampled_token_ids[
                         req_id_index_step]
                 new_token_id = sampled_token_ids[0]
-                self.output.sampled_token_ids.append([new_token_id])
+                self.output.sampled_token_ids[-1].append(new_token_id)
 
                 if model_runner_output.logprobs is not None:
                     self.output.logprobs.logprob_token_ids.append(
