@@ -150,7 +150,7 @@ class HATTokenizer(TokenizerBase):
         # Only needed for some tests where the system prompt is not included.
         #return "{%- set loop_messages = messages -%}{%- for message in loop_messages -%}{%- set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n' + message['content'] | trim + '<|eot_id|>' -%}{%- if loop.index0 == 0 -%}{%- set content = '<|begin_of_text|><|start_header_id|>system<|end_header_id|>\nYou are a helpful assistant. You give engaging, well-structured answers to user inquiries.<|eot_id|>' + content -%}{%- endif -%}{{- content -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|start_header_id|>assistant<|end_header_id|>' -}}{%- endif -%}"
         # We might need \n at the end of each message.
-        return "{%- set loop_messages = messages -%}{%- for message in loop_messages -%}{%- set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n' + message['content'] | trim + '<|eot_id|>' -%}{%- if loop.index0 == 0 -%}{%- set content = '<|begin_of_text|>' + content -%}{%- endif -%}{{- content -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|start_header_id|>assistant<|end_header_id|>' -}}{%- endif -%}"
+        return "<|begin_of_text|>{%- for message in messages -%}<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n{{ message['content'] }}<|eot_id|>{%- endfor -%}<|start_header_id|>assistant<|end_header_id|>\n\n\n"
 
     def convert_tokens_to_string(self, tokens: List[str]) -> str:
         return self.decode(int(token) for token in tokens)
