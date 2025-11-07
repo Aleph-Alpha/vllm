@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from transformers import BatchEncoding
 
 from vllm.transformers_utils.tokenizer_base import TokenizerBase
 from vllm.utils import is_list_of
@@ -93,6 +94,7 @@ class HATTokenizer(TokenizerBase):
                 each_input_ids = self.encode_one(p, truncation, max_length)
                 input_ids_.append(each_input_ids)
             input_ids = input_ids_
+            return BatchEncoding({"input_ids": input_ids})
         # For List[int], apply chat template output, already tokens.
         elif is_list_of(text, int):
             input_ids = text
