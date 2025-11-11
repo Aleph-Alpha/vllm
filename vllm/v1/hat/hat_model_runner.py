@@ -27,8 +27,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils import weak_ref_tensor
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.hat.hat_utils import (COMPRESSION_RATIO, HATBatchInput,
-                                   HATSubmodelRole)
+from vllm.v1.hat.hat_utils import (HATBatchInput, HATSubmodelRole)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -692,7 +691,7 @@ class HATModelRunner(GPUModelRunner):
 
     def profile_run(self) -> None:
         hidden_states = self._dummy_run(
-            max(1, self.max_num_tokens // COMPRESSION_RATIO)
+            max(1, self.max_num_tokens // envs.HAT_COMPRESSION_RATIO)
             if self.role == HATSubmodelRole.BACKBONE else self.max_num_tokens,
             create_input_tensors=True)
         if get_pp_group(
