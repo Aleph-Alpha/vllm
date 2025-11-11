@@ -302,10 +302,14 @@ class HATWorker(WorkerBase):
                                      scheduler_output_byte_enc_dec,
                                      prepare_inputs=True)
 
-        if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
-            with torch.cuda.stream(self.stream_backbone):
-                self.stream_backbone.wait_stream(self.default_stream)
-                self.stream_backbone.wait_stream(self.stream_enc_dec)
+        self.stream_backbone.wait_stream(self.stream_enc_dec)
+        self.stream_enc_dec.wait_stream(self.stream_backbone)
+        scheduler_output_word_decodes = self.hat_manager.scheduler_output_word_decodes
+
+        def _launch_final_decoder():
+            if not self._has_scheduled_requests(scheduler_output_byte_final_decoder):
+                return
+            with torch.cuda.stream(self.stream_enc_dec):
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(
                     scheduler_output_byte_final_decoder)
 
@@ -332,14 +336,23 @@ class HATWorker(WorkerBase):
                 self.hat_manager.process_outputs_prefill_chunked_prefill(
                     scheduler_output_byte_final_decoder, model_runner_output)
 
-        scheduler_output_word_decodes = self.hat_manager.scheduler_output_word_decodes
-        if self._has_scheduled_requests(scheduler_output_word_decodes):
-            self.stream_enc_dec.wait_stream(self.stream_backbone)
-            with torch.cuda.stream(self.stream_enc_dec):
+        def _launch_decode_backbone():
+            if not self._has_scheduled_requests(scheduler_output_word_decodes):
+                return
+            with torch.cuda.stream(self.stream_backbone):
                 predictive_word_embeddings = self.run_backbone(
                     scheduler_output_word_decodes)
                 self.hat_manager.update_backbone_info_decode_path(
                     predictive_word_embeddings)
+
+        if self.separate_backbone_enc_dec_streams:
+            # Run the backbone in parallel so the decoder stream can prep and finish first while the backbone keeps advancing.
+            _launch_decode_backbone()
+            _launch_final_decoder()
+        else:
+            # Without separate streams, finish the decoder (including its CPU sync) before starting the backbone to overlap with scheduler prep.
+            _launch_final_decoder()
+            _launch_decode_backbone()
 
         return self.hat_manager.finish_step()
 
