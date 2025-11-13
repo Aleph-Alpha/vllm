@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     HAT_COMPRESSION_RATIO: int = 4
     HAT_BYTES_PER_WORKER_STEP: int = 8
     HAT_LIMIT_FOR_STATIC_STEPS: int = 8
+    HAT_STEP_LOG_PATH: str = "/root/vllm_step_requests.log"
 
 
 def get_default_cache_root():
@@ -985,6 +986,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.environ.get("HAT_BYTES_PER_WORKER_STEP", "8")),
     "HAT_LIMIT_FOR_STATIC_STEPS":
     lambda: int(os.environ.get("HAT_LIMIT_FOR_STATIC_STEPS", "8")),
+    "HAT_STEP_LOG_PATH":
+    lambda: os.environ.get("HAT_STEP_LOG_PATH", "/root/vllm_hat_step_requests.log"),
 }
 
 # --8<-- [end:env-vars-definition]

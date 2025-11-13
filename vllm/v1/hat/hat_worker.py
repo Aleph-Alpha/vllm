@@ -4,6 +4,9 @@ import copy
 import dataclasses
 import gc
 import os
+import threading
+import time
+from queue import SimpleQueue
 from typing import List, Optional
 
 import torch
@@ -34,7 +37,6 @@ from vllm.v1.worker.utils import bind_kv_cache
 from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
-
 
 def create_hat_worker(*args, **kwargs):
     ModelRegistry.register_model(
@@ -96,6 +98,15 @@ class HATWorker(WorkerBase):
         self.encoder_connector = None
         self.hat_manager = None
         self.vllm_config = vllm_config
+
+        self._hat_step_log_queue = SimpleQueue()
+        self._hat_step_log_error_reported = False
+        self._hat_step_counter = 0
+        self._hat_step_log_thread = threading.Thread(
+            target=self._hat_step_log_worker,
+            name="hat-step-request-logger",
+            daemon=True)
+        self._hat_step_log_thread.start()
 
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
@@ -260,6 +271,8 @@ class HATWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
         self.hat_manager.remove_finished_requests(scheduler_output)
+        total_requests = self._get_scheduler_output_request_count(
+            scheduler_output)
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
 
@@ -267,15 +280,21 @@ class HATWorker(WorkerBase):
         self.default_stream.wait_stream(self.stream_enc_dec)
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(
             scheduler_output)
+        backbone_prefill_count = self._get_scheduler_output_request_count(
+            scheduler_output_word)
         encoder_hidden_states = self.encoder_worker.execute_model(
             scheduler_output_byte)
 
         encoder_hidden_states_phases, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte,
                                                    encoder_hidden_states))
+        decode_loop_count = self._get_scheduler_output_request_count(
+            scheduler_output_byte_enc_dec)
+        final_decoder_count = self._get_scheduler_output_request_count(
+            scheduler_output_byte_final_decoder)
 
         predictive_word_embeddings = None
-        if self._has_scheduled_requests(scheduler_output_word):
+        if backbone_prefill_count:
             self.stream_backbone.wait_stream(self.default_stream)
             self.stream_backbone.wait_stream(self.stream_enc_dec)
             with torch.cuda.stream(self.stream_backbone):
@@ -285,16 +304,15 @@ class HATWorker(WorkerBase):
                 self.hat_manager.update_backbone_info_prefill_path(
                     scheduler_output_word)
 
-        if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
+        predictive_word_embeddings_final_decoder = None
+        if final_decoder_count:
             with torch.cuda.stream(self.stream_backbone):
                 predictive_word_embeddings_final_decoder = self.hat_manager.handle_backbone_output(
                     scheduler_output_byte_final_decoder,
                     predictive_word_embeddings)
 
-        both_paths_active = self._has_scheduled_requests(
-            scheduler_output_byte_enc_dec) and self._has_scheduled_requests(
-                scheduler_output_byte_final_decoder)
-        if self._has_scheduled_requests(scheduler_output_byte_enc_dec):
+        both_paths_active = decode_loop_count > 0 and final_decoder_count > 0
+        if decode_loop_count:
             self.stream_enc_dec.wait_stream(self.default_stream)
             with torch.cuda.stream(self.stream_enc_dec):
                 self.run_decode_loop(encoder_hidden_states_phases.
@@ -305,9 +323,11 @@ class HATWorker(WorkerBase):
         self.stream_backbone.wait_stream(self.stream_enc_dec)
         self.stream_enc_dec.wait_stream(self.stream_backbone)
         scheduler_output_word_decodes = self.hat_manager.scheduler_output_word_decodes
+        backbone_decode_count = self._get_scheduler_output_request_count(
+            scheduler_output_word_decodes)
 
         def _launch_final_decoder():
-            if not self._has_scheduled_requests(scheduler_output_byte_final_decoder):
+            if not final_decoder_count:
                 return
             with torch.cuda.stream(self.stream_enc_dec):
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(
@@ -337,7 +357,7 @@ class HATWorker(WorkerBase):
                     scheduler_output_byte_final_decoder, model_runner_output)
 
         def _launch_decode_backbone():
-            if not self._has_scheduled_requests(scheduler_output_word_decodes):
+            if not backbone_decode_count:
                 return
             with torch.cuda.stream(self.stream_backbone):
                 predictive_word_embeddings = self.run_backbone(
@@ -354,7 +374,58 @@ class HATWorker(WorkerBase):
             _launch_final_decoder()
             _launch_decode_backbone()
 
+        self._log_hat_step_request_counts(total_requests,
+                                          backbone_prefill_count,
+                                          decode_loop_count,
+                                          backbone_decode_count,
+                                          final_decoder_count)
         return self.hat_manager.finish_step()
+
+    def _get_scheduler_output_request_count(
+            self, scheduler_output: Optional[SchedulerOutput]) -> int:
+        if scheduler_output is None:
+            return 0
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        cached_count = cached_reqs.num_reqs if cached_reqs is not None else 0
+        return len(scheduler_output.scheduled_new_reqs) + cached_count
+
+    def _log_hat_step_request_counts(
+        self,
+        total_requests: int,
+        backbone_prefill_count: int,
+        decode_loop_count: int,
+        backbone_decode_count: int,
+        final_decoder_count: int,
+    ) -> None:
+        self._hat_step_counter += 1
+        if self.rank != self.driver_rank:
+            return
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        log_line = (
+            f"{timestamp} | HATWorker step {self._hat_step_counter}: "
+            f"total {total_requests}; "
+            f"backbone_prefill {backbone_prefill_count}; "
+            f"decode_loop_start {decode_loop_count}; "
+            f"backbone_decode {backbone_decode_count}; "
+            f"final_decoder {final_decoder_count}")
+        self._hat_step_log_queue.put(log_line)
+
+    def _hat_step_log_worker(self) -> None:
+        while True:
+            log_line = self._hat_step_log_queue.get()
+            if log_line is None:
+                break
+            try:
+                with open(envs.HAT_STEP_LOG_PATH,
+                          "a",
+                          encoding="utf-8") as f:
+                    f.write(log_line + "\n")
+            except Exception:
+                if not self._hat_step_log_error_reported:
+                    logger.warning("Failed to write HAT step log line to %s",
+                                   envs.HAT_STEP_LOG_PATH,
+                                   exc_info=True)
+                    self._hat_step_log_error_reported = True
 
     def run_backbone(
         self,
@@ -426,11 +497,6 @@ class HATWorker(WorkerBase):
         self.hat_manager.first_word_embedding = (
             self.backbone_worker.get_model(
             ).decoder_connector.first_word_embedding.squeeze(0))
-
-    def _has_scheduled_requests(self,
-                                scheduler_output: SchedulerOutput) -> bool:
-        return bool(scheduler_output.scheduled_new_reqs
-                    or scheduler_output.scheduled_cached_reqs.req_ids)
 
     @property
     def rank(self):

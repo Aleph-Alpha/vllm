@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import itertools
+from queue import SimpleQueue
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -35,6 +37,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -175,6 +178,49 @@ class Scheduler(SchedulerInterface):
                 enable_kv_cache_events=self.enable_kv_cache_events,
             )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        
+        self.step_log_error_reported = False
+        self.step_log_queue = SimpleQueue[Any]()
+        self.step_counter = 0
+        self.step_log_thread = threading.Thread(
+            target=self._step_log_worker,
+            name="step-log-worker",
+            daemon=True
+        )
+        self.step_log_thread.start() 
+        
+    def _step_log_worker(self) -> None:
+        while True:
+            log_line = self.step_log_queue.get()
+            if log_line is None:
+                break
+            try:
+                with open(envs.HAT_STEP_LOG_PATH,
+                          "a",
+                          encoding="utf-8") as f:
+                    f.write(log_line + "\n")
+            except Exception:
+                if not self.step_log_error_reported:
+                    logger.warning("Failed to write scheduler step log line to %s",
+                                   envs.HAT_STEP_LOG_PATH,
+                                   exc_info=True)
+                    self.step_log_error_reported = True 
+                    
+    def _log_step_request_counts(self, scheduler_output: "SchedulerOutput", num_waiting_requests: int) -> None:
+        self.step_counter += 1
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
+        scheduled_cached_count = (
+            scheduled_cached_reqs.num_reqs if scheduled_cached_reqs is not None else 0)
+        scheduled_this_step = (
+            len(scheduler_output.scheduled_new_reqs) + scheduled_cached_count)
+        running_not_scheduled = max(len(self.running) - scheduled_this_step, 0)
+        remaining_pending = running_not_scheduled + num_waiting_requests
+        log_line = (
+            f"{timestamp} | Scheduler step {self.step_counter}: "
+            f"scheduled {scheduled_this_step}; "
+            f"remaining {remaining_pending}")
+        self.step_log_queue.put(log_line)           
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -578,6 +624,7 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
+        self._log_step_request_counts(scheduler_output, len(self.waiting))
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
