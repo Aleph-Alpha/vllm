@@ -1346,5 +1346,22 @@ def apply_mistral_chat_template(
             "template")
         raise ValueError(str(e)) from e
 
+def apply_hat_chat_template(
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+    conversation: list[ConversationMessage],
+    chat_template: Optional[str],
+    tools: Optional[list[dict[str, Any]]],
+    tokenize: bool = False,
+    **kwargs: Any,
+) -> str:
+    chat_template = tokenizer.get_chat_template(chat_template, tools=tools)
+    return tokenizer.apply_chat_template(
+        conversation=conversation,
+        chat_template=chat_template,
+        tools=tools,
+        tokenize=tokenize,
+        **kwargs,
+    )
+
 def random_tool_call_id() -> str:
     return f"chatcmpl-tool-{random_uuid()}"
