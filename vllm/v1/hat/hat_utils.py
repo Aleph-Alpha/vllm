@@ -12,15 +12,7 @@ from vllm.v1.hat.hat_splitter import HATRuleSplitter
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 
-# Constants
-
-COMPRESSION_RATIO = 4
-BYTES_PER_WORKER_STEP = 8
-LIMIT_FOR_STATIC_STEPS = 8
-
 # Data Classes
-
-
 @dataclass
 class HATSequenceState:
     # Store bytes of the current word and first byte of new word

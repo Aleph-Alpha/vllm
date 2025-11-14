@@ -24,6 +24,8 @@ class HATTokenizer(TokenizerBase):
         self.name_or_path = "HAT"
         self.jinja2_env = ImmutableSandboxedEnvironment()
         self.special_tokens_map = None
+        # Cache for compiled Jinja2 templates to avoid recompiling on every request
+        self._template_cache: Dict[str, Any] = {}
 
     @property
     def all_special_tokens_extended(self) -> List[str]:
@@ -141,7 +143,9 @@ class HATTokenizer(TokenizerBase):
                             tokenize: bool,
                             tools: Optional[List[Dict[str, Any]]] = None,
                             **kwargs) -> str:
-        compiled_template = self.jinja2_env.from_string(chat_template)
+        if chat_template not in self._template_cache:
+            self._template_cache[chat_template] = self.jinja2_env.from_string(chat_template)
+        compiled_template = self._template_cache[chat_template]
         rendered = compiled_template.render(messages=conversation,
                                             add_generation_prompt=True)
         return rendered

@@ -23,9 +23,7 @@ from vllm.utils import MemorySnapshot, resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hat.hat_manager import HATManager
 from vllm.v1.hat.hat_model_runner import HATModelRunner
-from vllm.v1.hat.hat_utils import (BYTES_PER_WORKER_STEP,
-                                   LIMIT_FOR_STATIC_STEPS, HATBatchInput,
-                                   _allocate_kv_cache_tensors,
+from vllm.v1.hat.hat_utils import (HATBatchInput, _allocate_kv_cache_tensors,
                                    _reshape_kv_cache_tensors, safe_list_slice)
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
@@ -71,8 +69,7 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args,
 
     if worker_config.model_config.hf_config.sliding_window is None:
         worker_config.cache_config.sliding_window = None
-    use_smaller_tp = kwargs.get("use_smaller_tp", False)
-    if architecture != "HATBackboneForCausalLM" and use_smaller_tp:
+    if architecture != "HATBackboneForCausalLM" and envs.HAT_USE_SMALLER_TP:
         worker_config.parallel_config.tensor_parallel_size = 1
         worker_config.parallel_config.world_size = 1
 
@@ -87,19 +84,17 @@ def _create_worker(hf_config: PretrainedConfig, architecture: str, *args,
 class HATWorker(WorkerBase):
 
     def __init__(self, encoder_worker: WorkerBase, decoder_worker: WorkerBase,
-                 backbone_worker: WorkerBase, vllm_config: VllmConfig, use_smaller_tp: bool = False):
+                 backbone_worker: WorkerBase, vllm_config: VllmConfig):
         self.encoder_worker = SmallerTpWorker(
             encoder_worker
-        ) if vllm_config.parallel_config.tensor_parallel_size > 1 and use_smaller_tp else encoder_worker
+        ) if vllm_config.parallel_config.tensor_parallel_size > 1 and envs.HAT_USE_SMALLER_TP else encoder_worker
         self.decoder_worker = SmallerTpWorker(
             decoder_worker
-        ) if vllm_config.parallel_config.tensor_parallel_size > 1 and use_smaller_tp else decoder_worker
+        ) if vllm_config.parallel_config.tensor_parallel_size > 1 and envs.HAT_USE_SMALLER_TP else decoder_worker
         self.backbone_worker = backbone_worker
 
         self.encoder_connector = None
         self.hat_manager = None
-        self.use_smaller_tp = use_smaller_tp
-
         self.vllm_config = vllm_config
 
         if envs.VLLM_TORCH_PROFILER_DIR:
@@ -145,12 +140,14 @@ class HATWorker(WorkerBase):
             self.decoder_model_runner)
 
         self.default_stream = torch.cuda.default_stream()
-        if not self.use_smaller_tp and self.vllm_config.parallel_config.tensor_parallel_size > 1:
+        if not envs.HAT_USE_SMALLER_TP and self.vllm_config.parallel_config.tensor_parallel_size > 1:
             self.stream_backbone = torch.cuda.default_stream()
             self.stream_enc_dec = torch.cuda.default_stream()
+            self.separate_backbone_enc_dec_streams = False
         else:
-            self.stream_backbone = torch.cuda.Stream()
-            self.stream_enc_dec = torch.cuda.Stream()
+            self.stream_backbone = torch.cuda.Stream(priority=0)
+            self.stream_enc_dec = torch.cuda.Stream(priority=-3)
+            self.separate_backbone_enc_dec_streams = True
             
     def load_model(self) -> None:
         pass
@@ -305,10 +302,14 @@ class HATWorker(WorkerBase):
                                      scheduler_output_byte_enc_dec,
                                      prepare_inputs=True)
 
-        if self._has_scheduled_requests(scheduler_output_byte_final_decoder):
-            with torch.cuda.stream(self.stream_backbone):
-                self.stream_backbone.wait_stream(self.default_stream)
-                self.stream_backbone.wait_stream(self.stream_enc_dec)
+        self.stream_backbone.wait_stream(self.stream_enc_dec)
+        self.stream_enc_dec.wait_stream(self.stream_backbone)
+        scheduler_output_word_decodes = self.hat_manager.scheduler_output_word_decodes
+
+        def _launch_final_decoder():
+            if not self._has_scheduled_requests(scheduler_output_byte_final_decoder):
+                return
+            with torch.cuda.stream(self.stream_enc_dec):
                 word_lens_bytes = self.hat_manager.prepare_input_final_decoder(
                     scheduler_output_byte_final_decoder)
 
@@ -335,14 +336,23 @@ class HATWorker(WorkerBase):
                 self.hat_manager.process_outputs_prefill_chunked_prefill(
                     scheduler_output_byte_final_decoder, model_runner_output)
 
-        scheduler_output_word_decodes = self.hat_manager.scheduler_output_word_decodes
-        if self._has_scheduled_requests(scheduler_output_word_decodes):
-            self.stream_enc_dec.wait_stream(self.stream_backbone)
-            with torch.cuda.stream(self.stream_enc_dec):
+        def _launch_decode_backbone():
+            if not self._has_scheduled_requests(scheduler_output_word_decodes):
+                return
+            with torch.cuda.stream(self.stream_backbone):
                 predictive_word_embeddings = self.run_backbone(
                     scheduler_output_word_decodes)
                 self.hat_manager.update_backbone_info_decode_path(
                     predictive_word_embeddings)
+
+        if self.separate_backbone_enc_dec_streams:
+            # Run the backbone in parallel so the decoder stream can prep and finish first while the backbone keeps advancing.
+            _launch_decode_backbone()
+            _launch_final_decoder()
+        else:
+            # Without separate streams, finish the decoder (including its CPU sync) before starting the backbone to overlap with scheduler prep.
+            _launch_final_decoder()
+            _launch_decode_backbone()
 
         return self.hat_manager.finish_step()
 
@@ -378,11 +388,11 @@ class HATWorker(WorkerBase):
         num_decodes_running = len(
             scheduler_output.scheduled_cached_reqs.req_ids)
 
-        process_full_word = num_decodes_running <= LIMIT_FOR_STATIC_STEPS
+        process_full_word = num_decodes_running <= envs.HAT_LIMIT_FOR_STATIC_STEPS
 
         bytes_processed = 0
         while num_decodes_running > 0 and (
-                bytes_processed < BYTES_PER_WORKER_STEP or process_full_word):
+                bytes_processed < envs.HAT_BYTES_PER_WORKER_STEP or process_full_word):
             encoder_hidden_states = self.encoder_worker.execute_model(
                 scheduler_output)
             self.hat_manager.handle_encoder_output_loop(
