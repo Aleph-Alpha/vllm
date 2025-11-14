@@ -140,6 +140,10 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: Optional[int] = None
     VLLM_NIXL_ABORT_REQUEST_TIMEOUT: int = 120
+    HAT_USE_SMALLER_TP: bool = False
+    HAT_COMPRESSION_RATIO: int = 4
+    HAT_BYTES_PER_WORKER_STEP: int = 8
+    HAT_LIMIT_FOR_STATIC_STEPS: int = 8
 
 
 def get_default_cache_root():
@@ -970,6 +974,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, use the TRTLLM Decode Attention backend in flashinfer.
     "VLLM_USE_TRTLLM_DECODE_ATTENTION":
     lambda: os.getenv("VLLM_USE_TRTLLM_DECODE_ATTENTION", None),
+    
+    # HAT-specific configuration knobs.
+    "HAT_USE_SMALLER_TP":
+    lambda: (os.environ.get("HAT_USE_SMALLER_TP", "False").lower()
+             in ("true", "1")),
+    "HAT_COMPRESSION_RATIO":
+    lambda: int(os.environ.get("HAT_COMPRESSION_RATIO", "4")),
+    "HAT_BYTES_PER_WORKER_STEP":
+    lambda: int(os.environ.get("HAT_BYTES_PER_WORKER_STEP", "8")),
+    "HAT_LIMIT_FOR_STATIC_STEPS":
+    lambda: int(os.environ.get("HAT_LIMIT_FOR_STATIC_STEPS", "8")),
 }
 
 # --8<-- [end:env-vars-definition]
