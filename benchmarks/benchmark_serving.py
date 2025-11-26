@@ -89,14 +89,17 @@ class BenchmarkMetrics:
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
+    mad_ttft_ms: float
     percentiles_ttft_ms: list[tuple[float, float]]
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
+    mad_tpot_ms: float
     percentiles_tpot_ms: list[tuple[float, float]]
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
+    mad_itl_ms: float
     percentiles_itl_ms: list[tuple[float, float]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
@@ -104,6 +107,7 @@ class BenchmarkMetrics:
     mean_e2el_ms: float
     median_e2el_ms: float
     std_e2el_ms: float
+    mad_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
 
 
@@ -287,6 +291,13 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
+
+    # Precompute medians to avoid redundant calculations for MAD (median absolute deviation)
+    ttft_median = np.median(ttfts) if ttfts else 0.0
+    tpot_median = np.median(tpots) if tpots else 0.0
+    itl_median = np.median(itls) if itls else 0.0
+    e2el_median = np.median(e2els) if e2els else 0.0
+
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -298,25 +309,37 @@ def calculate_metrics(
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         std_ttft_ms=np.std(ttfts or 0) * 1000,
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
+        mad_ttft_ms=np.median(np.abs(np.array(ttfts) - ttft_median)) * 1000
+        if ttfts
+        else 0.0,
+        median_ttft_ms=ttft_median * 1000,
         percentiles_ttft_ms=[
             (p, np.percentile(ttfts or 0, p) * 1000) for p in selected_percentiles
         ],
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
+        mad_tpot_ms=np.median(np.abs(np.array(tpots) - tpot_median)) * 1000
+        if tpots
+        else 0.0,
+        median_tpot_ms=tpot_median * 1000,
         percentiles_tpot_ms=[
             (p, np.percentile(tpots or 0, p) * 1000) for p in selected_percentiles
         ],
         mean_itl_ms=np.mean(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
+        mad_itl_ms=np.median(np.abs(np.array(itls) - itl_median)) * 1000
+        if itls
+        else 0.0,
+        median_itl_ms=itl_median * 1000,
         percentiles_itl_ms=[
             (p, np.percentile(itls or 0, p) * 1000) for p in selected_percentiles
         ],
         mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
-        median_e2el_ms=np.median(e2els or 0) * 1000,
+        mad_e2el_ms=np.median(np.abs(np.array(e2els) - e2el_median)) * 1000
+        if e2els
+        else 0.0,
+        median_e2el_ms=e2el_median * 1000,
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
@@ -605,6 +628,9 @@ async def benchmark(
         )
         result[f"std_{metric_attribute_name}_ms"] = getattr(
             metrics, f"std_{metric_attribute_name}_ms"
+        )
+        result[f"mad_{metric_attribute_name}_ms"] = getattr(
+            metrics, f"mad_{metric_attribute_name}_ms"
         )
         for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}_ms"):
             p_word = str(int(p)) if int(p) == p else str(p)
