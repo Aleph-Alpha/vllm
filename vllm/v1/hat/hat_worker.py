@@ -102,6 +102,7 @@ class HATWorker(WorkerBase):
         self._hat_step_log_queue = SimpleQueue()
         self._hat_step_log_error_reported = False
         self._hat_step_counter = 0
+        self._prev_step_info = None
         self._hat_step_log_thread = threading.Thread(
             target=self._hat_step_log_worker,
             name="hat-step-request-logger",
@@ -160,6 +161,17 @@ class HATWorker(WorkerBase):
             self.stream_enc_dec = torch.cuda.Stream(priority=-3)
             self.separate_backbone_enc_dec_streams = True
             
+        self.start_first_encoder = torch.cuda.Event(enable_timing=True)
+        self.end_first_encoder = torch.cuda.Event(enable_timing=True)
+        self.start_backbone_prefill = torch.cuda.Event(enable_timing=True)
+        self.end_backbone_prefill = torch.cuda.Event(enable_timing=True)
+        self.start_encdec_loop = torch.cuda.Event(enable_timing=True)
+        self.end_encdec_loop = torch.cuda.Event(enable_timing=True)
+        self.start_final_decoder = torch.cuda.Event(enable_timing=True)
+        self.end_final_decoder = torch.cuda.Event(enable_timing=True)
+        self.start_backbone_decode = torch.cuda.Event(enable_timing=True)
+        self.end_backbone_decode = torch.cuda.Event(enable_timing=True)
+
     def load_model(self) -> None:
         pass
 
@@ -276,15 +288,25 @@ class HATWorker(WorkerBase):
         if not scheduler_output.num_scheduled_tokens:
             return self._handle_empty_scheduler_output(scheduler_output)
 
-        self.default_stream.wait_stream(self.stream_backbone)
-        self.default_stream.wait_stream(self.stream_enc_dec)
+        # Option A
+        # self.default_stream.wait_stream(self.stream_backbone)
+        # self.default_stream.wait_stream(self.stream_enc_dec)
+                
+        # Option B
+        torch.cuda.synchronize()
+        
+        # Measure times from the previous step
+        if self._prev_step_info is not None:
+            self._measure_and_log_step_times()
+
         scheduler_output_byte, scheduler_output_word = self.hat_manager.add_request(
             scheduler_output)
         backbone_prefill_count = self._get_scheduler_output_request_count(
             scheduler_output_word)
+        self.start_first_encoder.record()
         encoder_hidden_states = self.encoder_worker.execute_model(
             scheduler_output_byte)
-
+        self.end_first_encoder.record()
         encoder_hidden_states_phases, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte,
                                                    encoder_hidden_states))
@@ -298,12 +320,14 @@ class HATWorker(WorkerBase):
             self.stream_backbone.wait_stream(self.default_stream)
             self.stream_backbone.wait_stream(self.stream_enc_dec)
             with torch.cuda.stream(self.stream_backbone):
+                self.start_backbone_prefill.record()
                 predictive_word_embeddings = self.run_backbone(
                     scheduler_output_word, encoder_hidden_states_phases.
                     encoder_hidden_states_encoder_connector)
+                self.end_backbone_prefill.record()
                 self.hat_manager.update_backbone_info_prefill_path(
                     scheduler_output_word)
-
+                
         predictive_word_embeddings_final_decoder = None
         if final_decoder_count:
             with torch.cuda.stream(self.stream_backbone):
@@ -315,11 +339,13 @@ class HATWorker(WorkerBase):
         if decode_loop_count:
             self.stream_enc_dec.wait_stream(self.default_stream)
             with torch.cuda.stream(self.stream_enc_dec):
+                self.start_encdec_loop.record()
                 self.run_decode_loop(encoder_hidden_states_phases.
                                      encoder_hidden_states_enc_dec_loop,
                                      scheduler_output_byte_enc_dec,
                                      prepare_inputs=True)
-
+                self.end_encdec_loop.record()
+        
         self.stream_backbone.wait_stream(self.stream_enc_dec)
         self.stream_enc_dec.wait_stream(self.stream_backbone)
         scheduler_output_word_decodes = self.hat_manager.scheduler_output_word_decodes
@@ -339,10 +365,12 @@ class HATWorker(WorkerBase):
                     encoder_hidden_states=encoder_hidden_states_phases.
                     encoder_hidden_states_final_decoder,
                     word_lens_bytes=word_lens_bytes)
+                self.start_final_decoder.record()
                 model_runner_output = self.decoder_worker.execute_model(
                     scheduler_output_byte_final_decoder,
                     hat_batch_input_final_decoder,
                     prepare_inputs=both_paths_active)
+                self.end_final_decoder.record()
 
                 scheduled_cached_reqs_dec_word_boundary_req_ids = safe_list_slice(
                     scheduler_output_byte_final_decoder.scheduled_cached_reqs.
@@ -360,8 +388,10 @@ class HATWorker(WorkerBase):
             if not backbone_decode_count:
                 return
             with torch.cuda.stream(self.stream_backbone):
+                self.start_backbone_decode.record()
                 predictive_word_embeddings = self.run_backbone(
                     scheduler_output_word_decodes)
+                self.end_backbone_decode.record()
                 self.hat_manager.update_backbone_info_decode_path(
                     predictive_word_embeddings)
 
@@ -374,11 +404,10 @@ class HATWorker(WorkerBase):
             _launch_final_decoder()
             _launch_decode_backbone()
 
-        self._log_hat_step_request_counts(total_requests,
-                                          backbone_prefill_count,
-                                          decode_loop_count,
-                                          backbone_decode_count,
-                                          final_decoder_count)
+        backbone_prefill_words = scheduler_output_word.total_num_scheduled_tokens
+        self._record_step_metadata(total_requests, backbone_prefill_count,
+                                   backbone_prefill_words, decode_loop_count,
+                                   backbone_decode_count, final_decoder_count)
         return self.hat_manager.finish_step()
 
     def _get_scheduler_output_request_count(
@@ -389,26 +418,103 @@ class HATWorker(WorkerBase):
         cached_count = cached_reqs.num_reqs if cached_reqs is not None else 0
         return len(scheduler_output.scheduled_new_reqs) + cached_count
 
-    def _log_hat_step_request_counts(
+    def _measure_and_log_step_times(self):
+        prev_info = self._prev_step_info
+        if prev_info is None:
+            return
+
+        activity = prev_info["activity"]
+        
+        def _get_time(start_event, end_event, is_active):
+            if is_active:
+                return start_event.elapsed_time(end_event)
+            return "NA"
+
+        time_first_encoder = _get_time(self.start_first_encoder,
+                                       self.end_first_encoder, True)
+        time_backbone_prefill = _get_time(self.start_backbone_prefill,
+                                          self.end_backbone_prefill,
+                                          activity["backbone_prefill"])
+        time_encdec_loop = _get_time(self.start_encdec_loop,
+                                     self.end_encdec_loop,
+                                     activity["decode_loop"])
+        time_final_decoder = _get_time(self.start_final_decoder,
+                                       self.end_final_decoder,
+                                       activity["final_decoder"])
+        time_backbone_decode = _get_time(self.start_backbone_decode,
+                                         self.end_backbone_decode,
+                                         activity["backbone_decode"])
+
+        # Calculate total worker step time
+        # We look for the latest end event among the active components        
+        
+        active_end_events = [self.end_first_encoder]
+        if activity["backbone_prefill"]:
+            active_end_events.append(self.end_backbone_prefill)
+        if activity["decode_loop"]:
+            active_end_events.append(self.end_encdec_loop)
+        if activity["backbone_decode"]:
+            active_end_events.append(self.end_backbone_decode)
+        if activity["final_decoder"]:
+            active_end_events.append(self.end_final_decoder)
+
+        if active_end_events:
+            time_worker_step = max(
+                self.start_first_encoder.elapsed_time(end_event)
+                for end_event in active_end_events)
+        else:
+            time_worker_step = "NA"
+
+        if self.rank != self.driver_rank:
+            return
+
+        def _fmt(val):
+            return f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
+
+        log_line = (
+            f"{prev_info['timestamp']} | HATWorker step {prev_info['step_counter']}: "
+            f"total {prev_info['total_requests']}; "
+            f"backbone_prefill {prev_info['backbone_prefill_count']}; "
+            f"backbone_prefill_words {prev_info['backbone_prefill_words']}; "
+            f"decode_loop_start {prev_info['decode_loop_count']}; "
+            f"backbone_decode {prev_info['backbone_decode_count']}; "
+            f"final_decoder {prev_info['final_decoder_count']}; "
+            f"time_worker_step {_fmt(time_worker_step)}; "
+            f"time_first_encoder {_fmt(time_first_encoder)}; "
+            f"time_backbone_prefill {_fmt(time_backbone_prefill)}; "
+            f"time_encdec_loop {_fmt(time_encdec_loop)}; "
+            f"time_final_decoder {_fmt(time_final_decoder)}; "
+            f"time_backbone_decode {_fmt(time_backbone_decode)}")
+        self._hat_step_log_queue.put(log_line)
+
+    def _record_step_metadata(
         self,
         total_requests: int,
         backbone_prefill_count: int,
+        backbone_prefill_words: int,
         decode_loop_count: int,
         backbone_decode_count: int,
         final_decoder_count: int,
     ) -> None:
         self._hat_step_counter += 1
-        if self.rank != self.driver_rank:
-            return
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        log_line = (
-            f"{timestamp} | HATWorker step {self._hat_step_counter}: "
-            f"total {total_requests}; "
-            f"backbone_prefill {backbone_prefill_count}; "
-            f"decode_loop_start {decode_loop_count}; "
-            f"backbone_decode {backbone_decode_count}; "
-            f"final_decoder {final_decoder_count}")
-        self._hat_step_log_queue.put(log_line)
+        
+        self._prev_step_info = {
+            "timestamp": timestamp,
+            "step_counter": self._hat_step_counter,
+            "total_requests": total_requests,
+            "backbone_prefill_count": backbone_prefill_count,
+            "backbone_prefill_words": backbone_prefill_words,
+            "decode_loop_count": decode_loop_count,
+            "backbone_decode_count": backbone_decode_count,
+            "final_decoder_count": final_decoder_count,
+            "activity": {
+                "backbone_prefill": backbone_prefill_count > 0,
+                "decode_loop": decode_loop_count > 0,
+                "backbone_decode": backbone_decode_count > 0,
+                "final_decoder": final_decoder_count > 0,
+            }
+        }
 
     def _hat_step_log_worker(self) -> None:
         while True:
