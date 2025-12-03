@@ -89,6 +89,9 @@ class HATModelRunner(GPUModelRunner):
                     self.model_config.hf_config.hidden_size,
                     dtype=self.dtype,
                     device=self.device)
+        
+        self.start_forward_pass = torch.cuda.Event(enable_timing=True)
+        self.end_forward_pass = torch.cuda.Event(enable_timing=True)
 
     def register_request(self, new_req_data: NewRequestData) -> None:
         req_id = new_req_data.req_id
@@ -472,12 +475,13 @@ class HATModelRunner(GPUModelRunner):
                                  skip_cuda_graphs=skip_cuda_graphs):
             self.maybe_setup_kv_connector(scheduler_output)
 
+            self.start_forward_pass.record()
             if use_cuda_graph:
                 graph, model_output = self.graphs[num_input_tokens]
                 graph.replay()
             else:
                 model_output = self.model(**model_kwargs)
-
+            self.end_forward_pass.record()
             self.maybe_wait_for_kv_save()
 
         if self.use_aux_hidden_state_outputs:

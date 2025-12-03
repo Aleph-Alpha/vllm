@@ -171,6 +171,13 @@ class HATWorker(WorkerBase):
         self.end_final_decoder = torch.cuda.Event(enable_timing=True)
         self.start_backbone_decode = torch.cuda.Event(enable_timing=True)
         self.end_backbone_decode = torch.cuda.Event(enable_timing=True)
+        self.start_first_decoder_loop = torch.cuda.Event(enable_timing=True)
+        self.end_first_decoder_loop = torch.cuda.Event(enable_timing=True)
+
+        # Storage for forward-pass-only times (captured immediately after each call)
+        self._forward_time_first_encoder = None
+        self._forward_time_first_decoder_loop = None
+        self._forward_time_backbone_decode = None
 
     def load_model(self) -> None:
         pass
@@ -303,10 +310,18 @@ class HATWorker(WorkerBase):
             scheduler_output)
         backbone_prefill_count = self._get_scheduler_output_request_count(
             scheduler_output_word)
+        
         self.start_first_encoder.record()
         encoder_hidden_states = self.encoder_worker.execute_model(
             scheduler_output_byte)
         self.end_first_encoder.record()
+        
+        # Capture forward-pass-only time immediately (before events get overwritten)
+        torch.cuda.synchronize()
+        self._forward_time_first_encoder = (
+            self.encoder_model_runner.start_forward_pass.elapsed_time(
+                self.encoder_model_runner.end_forward_pass))
+        
         encoder_hidden_states_phases, scheduler_output_byte_enc_dec, scheduler_output_byte_final_decoder = (
             self.hat_manager.handle_encoder_output(scheduler_output_byte,
                                                    encoder_hidden_states))
@@ -345,6 +360,8 @@ class HATWorker(WorkerBase):
                                      scheduler_output_byte_enc_dec,
                                      prepare_inputs=True)
                 self.end_encdec_loop.record()
+        else:
+            self._forward_time_first_decoder_loop = None
         
         self.stream_backbone.wait_stream(self.stream_enc_dec)
         self.stream_enc_dec.wait_stream(self.stream_backbone)
@@ -386,12 +403,20 @@ class HATWorker(WorkerBase):
 
         def _launch_decode_backbone():
             if not backbone_decode_count:
+                self._forward_time_backbone_decode = None
                 return
             with torch.cuda.stream(self.stream_backbone):
                 self.start_backbone_decode.record()
                 predictive_word_embeddings = self.run_backbone(
                     scheduler_output_word_decodes)
                 self.end_backbone_decode.record()
+                
+                # Capture forward-pass-only time immediately
+                torch.cuda.synchronize()
+                self._forward_time_backbone_decode = (
+                    self.backbone_model_runner.start_forward_pass.elapsed_time(
+                        self.backbone_model_runner.end_forward_pass))
+                
                 self.hat_manager.update_backbone_info_decode_path(
                     predictive_word_embeddings)
 
@@ -444,6 +469,9 @@ class HATWorker(WorkerBase):
         time_backbone_decode = _get_time(self.start_backbone_decode,
                                          self.end_backbone_decode,
                                          activity["backbone_decode"])
+        time_first_decoder_loop = _get_time(self.start_first_decoder_loop,
+                                            self.end_first_decoder_loop,
+                                            activity["decode_loop"])
 
         # Calculate total worker step time
         # We look for the latest end event among the active components        
@@ -471,6 +499,11 @@ class HATWorker(WorkerBase):
         def _fmt(val):
             return f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
 
+        # Get forward-pass-only times (captured immediately during step)
+        fwd_first_encoder = prev_info.get("forward_time_first_encoder")
+        fwd_first_decoder = prev_info.get("forward_time_first_decoder_loop")
+        fwd_backbone_decode = prev_info.get("forward_time_backbone_decode")
+
         log_line = (
             f"{prev_info['timestamp']} | HATWorker step {prev_info['step_counter']}: "
             f"total {prev_info['total_requests']}; "
@@ -481,10 +514,14 @@ class HATWorker(WorkerBase):
             f"final_decoder {prev_info['final_decoder_count']}; "
             f"time_worker_step {_fmt(time_worker_step)}; "
             f"time_first_encoder {_fmt(time_first_encoder)}; "
+            f"fwd_first_encoder {_fmt(fwd_first_encoder)}; "
             f"time_backbone_prefill {_fmt(time_backbone_prefill)}; "
             f"time_encdec_loop {_fmt(time_encdec_loop)}; "
+            f"time_first_decoder_loop {_fmt(time_first_decoder_loop)}; "
+            f"fwd_first_decoder_loop {_fmt(fwd_first_decoder)}; "
             f"time_final_decoder {_fmt(time_final_decoder)}; "
-            f"time_backbone_decode {_fmt(time_backbone_decode)}")
+            f"time_backbone_decode {_fmt(time_backbone_decode)}; "
+            f"fwd_backbone_decode {_fmt(fwd_backbone_decode)}")
         self._hat_step_log_queue.put(log_line)
 
     def _record_step_metadata(
@@ -513,7 +550,11 @@ class HATWorker(WorkerBase):
                 "decode_loop": decode_loop_count > 0,
                 "backbone_decode": backbone_decode_count > 0,
                 "final_decoder": final_decoder_count > 0,
-            }
+            },
+            # Forward-pass-only times (captured immediately during the step)
+            "forward_time_first_encoder": self._forward_time_first_encoder,
+            "forward_time_first_decoder_loop": self._forward_time_first_decoder_loop,
+            "forward_time_backbone_decode": self._forward_time_backbone_decode,
         }
 
     def _hat_step_log_worker(self) -> None:
@@ -557,8 +598,17 @@ class HATWorker(WorkerBase):
         hat_batch_input = HATBatchInput(
             predictive_word_embeddings=predictive_word_embeddings,
             encoder_hidden_states=encoder_hidden_states)
+        self.start_first_decoder_loop.record()
         model_runner_output = self.decoder_worker.execute_model(
             scheduler_output, hat_batch_input, prepare_inputs=prepare_inputs)
+        self.end_first_decoder_loop.record()
+        
+        # Capture forward-pass-only time immediately (before events get overwritten by loop iterations)
+        torch.cuda.synchronize()
+        self._forward_time_first_decoder_loop = (
+            self.decoder_model_runner.start_forward_pass.elapsed_time(
+                self.decoder_model_runner.end_forward_pass))
+        
         scheduler_output = self.hat_manager.process_outputs_enc_dec_loop(
             scheduler_output.scheduled_cached_reqs.req_ids,
             model_runner_output)
