@@ -178,6 +178,9 @@ class HATWorker(WorkerBase):
         self._forward_time_first_encoder = None
         self._forward_time_first_decoder_loop = None
         self._forward_time_backbone_decode = None
+        
+        # Track num_decodes_running at each iteration of run_decode_loop
+        self._decode_loop_counts = []
 
     def load_model(self) -> None:
         pass
@@ -362,6 +365,7 @@ class HATWorker(WorkerBase):
                 self.end_encdec_loop.record()
         else:
             self._forward_time_first_decoder_loop = None
+            self._decode_loop_counts = []
         
         self.stream_backbone.wait_stream(self.stream_enc_dec)
         self.stream_enc_dec.wait_stream(self.stream_backbone)
@@ -503,6 +507,7 @@ class HATWorker(WorkerBase):
         fwd_first_encoder = prev_info.get("forward_time_first_encoder")
         fwd_first_decoder = prev_info.get("forward_time_first_decoder_loop")
         fwd_backbone_decode = prev_info.get("forward_time_backbone_decode")
+        decode_loop_counts = prev_info.get("decode_loop_counts", [])
 
         log_line = (
             f"{prev_info['timestamp']} | HATWorker step {prev_info['step_counter']}: "
@@ -521,7 +526,8 @@ class HATWorker(WorkerBase):
             f"fwd_first_decoder_loop {_fmt(fwd_first_decoder)}; "
             f"time_final_decoder {_fmt(time_final_decoder)}; "
             f"time_backbone_decode {_fmt(time_backbone_decode)}; "
-            f"fwd_backbone_decode {_fmt(fwd_backbone_decode)}")
+            f"fwd_backbone_decode {_fmt(fwd_backbone_decode)}; "
+            f"decode_loop_counts {decode_loop_counts}")
         self._hat_step_log_queue.put(log_line)
 
     def _record_step_metadata(
@@ -555,6 +561,8 @@ class HATWorker(WorkerBase):
             "forward_time_first_encoder": self._forward_time_first_encoder,
             "forward_time_first_decoder_loop": self._forward_time_first_decoder_loop,
             "forward_time_backbone_decode": self._forward_time_backbone_decode,
+            # Decode loop counts at each iteration
+            "decode_loop_counts": self._decode_loop_counts.copy(),
         }
 
     def _hat_step_log_worker(self) -> None:
@@ -593,6 +601,9 @@ class HATWorker(WorkerBase):
                         encoder_hidden_states: torch.Tensor,
                         scheduler_output: SchedulerOutput,
                         prepare_inputs: bool = True):
+        # Reset decode loop counts for this step
+        self._decode_loop_counts = []
+        
         predictive_word_embeddings = self.hat_manager.prepare_exec_model_req_for_dec_autoregressive_phase(
             scheduler_output)
         hat_batch_input = HATBatchInput(
@@ -614,6 +625,9 @@ class HATWorker(WorkerBase):
             model_runner_output)
         num_decodes_running = len(
             scheduler_output.scheduled_cached_reqs.req_ids)
+        
+        # Track count after first iteration
+        self._decode_loop_counts.append(num_decodes_running)
 
         process_full_word = num_decodes_running <= envs.HAT_LIMIT_FOR_STATIC_STEPS
 
@@ -639,6 +653,9 @@ class HATWorker(WorkerBase):
             bytes_processed += 1
             num_decodes_running = len(
                 scheduler_output.scheduled_cached_reqs.req_ids)
+            
+            # Track count after each iteration
+            self._decode_loop_counts.append(num_decodes_running)
 
     def _handle_empty_scheduler_output(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
