@@ -8,7 +8,8 @@ from transformers import BatchEncoding
 
 from vllm.transformers_utils.tokenizer_base import TokenizerBase
 from vllm.utils import is_list_of
-from vllm.v1.hat.hat_splitter import HATRuleSplitter
+from vllm.v1.hat.hat_splitter import HATFixedSplitter, HATRuleSplitter
+import vllm.envs as envs
 
 
 @dataclass
@@ -20,7 +21,10 @@ class Encoding:
 class HATTokenizer(TokenizerBase):
 
     def __init__(self, special_token_dict: Dict[str, int]):
-        self.hat_splitter = HATRuleSplitter(special_token_dict)
+        if envs.HAT_FIXED_SIZE_SPLITTER_CHUNK:
+            self.hat_splitter = HATFixedSplitter(special_token_dict)
+        else:
+            self.hat_splitter = HATRuleSplitter(special_token_dict)
         self.name_or_path = "HAT"
         self.jinja2_env = ImmutableSandboxedEnvironment()
         self.special_tokens_map = None

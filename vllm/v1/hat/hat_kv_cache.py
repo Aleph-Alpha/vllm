@@ -13,12 +13,13 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock, init_none_hash
 from vllm.v1.core.single_type_kv_cache_manager import (
     get_manager_for_kv_cache_spec)
-from vllm.v1.hat.hat_splitter import HATRuleSplitter
+from vllm.v1.hat.hat_splitter import HATFixedSplitter, HATRuleSplitter
 from vllm.v1.hat.hat_utils import HATKVCacheState, split_text
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         SlidingWindowSpec)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -67,9 +68,11 @@ class HATKVCacheManager(KVCacheManager):
             str, list[BlockHash]] = defaultdict(list)
 
         self.req_id_to_hat_info: Dict[str, HATKVCacheState] = {}
-        self.hat_splitter = HATRuleSplitter(
-            special_token_dict=vllm_config.model_config.hf_config.
-            special_token_dict,
+        if envs.HAT_FIXED_SIZE_SPLITTER_CHUNK:
+            self.hat_splitter = HATFixedSplitter(vllm_config.model_config.hf_config.special_token_dict)
+        else:
+            self.hat_splitter = HATRuleSplitter(
+            vllm_config.model_config.hf_config.special_token_dict,
             max_word_size=vllm_config.model_config.hf_config.max_word_size)
 
     def get_computed_blocks(self,

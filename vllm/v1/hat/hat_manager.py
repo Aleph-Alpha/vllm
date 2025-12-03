@@ -7,7 +7,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.hat.hat_model_runner import HATModelRunner
-from vllm.v1.hat.hat_splitter import HATRuleSplitter
+from vllm.v1.hat.hat_splitter import HATFixedSplitter, HATRuleSplitter
 from vllm.v1.hat.hat_utils import (HATEncoderConnectorInput,
                                    HATEncoderHiddenStatesPhases,
                                    HATRequestType, HATSequenceState,
@@ -16,6 +16,7 @@ from vllm.v1.hat.hat_utils import (HATEncoderConnectorInput,
                                    check_byte_for_new_word, safe_list_slice,
                                    safe_tensor_slice, split_text)
 from vllm.v1.outputs import ModelRunnerOutput
+import vllm.envs as envs
 
 
 class HATManager:
@@ -26,7 +27,10 @@ class HATManager:
         self.vllm_config = vllm_config
         self.max_model_len = vllm_config.model_config.max_model_len
         self.req_ids_to_hat_state: Dict[str, HATSequenceState] = {}
-        self.hat_splitter = HATRuleSplitter(
+        if envs.HAT_FIXED_SIZE_SPLITTER_CHUNK:
+            self.hat_splitter = HATFixedSplitter(vllm_config.model_config.hf_config.special_token_dict)
+        else:
+            self.hat_splitter = HATRuleSplitter(
             vllm_config.model_config.hf_config.special_token_dict,
             max_word_size=vllm_config.model_config.hf_config.max_word_size)
         self.backbone_model_runner = backbone_model_runner
